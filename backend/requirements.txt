@@ -41,7 +41,7 @@ protobuf==6.33.5
 psycopg==3.3.3
 psycopg-binary==3.3.3
 psycopg2-binary==2.9.12
-pyarrow==23.0.1
+pyarrow==26.0.0
 pydantic==2.13.4
 pydantic_core==2.46.4
 pydeck==0.9.1
