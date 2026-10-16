@@ -75,7 +75,7 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2025.3
 urllib3==2.7.0
-uvicorn==0.47.0
+uvicorn==0.54.0
 watchdog==6.0.0
 Werkzeug==3.1.6
 google-auth==2.40.3
