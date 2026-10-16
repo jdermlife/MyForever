@@ -1,0 +1,68 @@
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import { GoogleOAuthProvider } from '@react-oauth/google'
+import { BrowserRouter } from 'react-router-dom'
+import { Capacitor } from '@capacitor/core'
+import { StatusBar, Style } from '@capacitor/status-bar'
+import { Keyboard, KeyboardResize } from '@capacitor/keyboard'
+import { SplashScreen } from '@capacitor/splash-screen'
+import App from './App'
+import { APP_CONFIG } from './config'
+import { initializeNativeGoogleSignIn } from './googleAuth'
+import './index.css'
+
+const isNativeMobileApp = Capacitor.isNativePlatform()
+
+document.documentElement.classList.toggle('native-mobile-app', isNativeMobileApp)
+document.documentElement.dataset.platform = Capacitor.getPlatform()
+
+const setupNativeMobileRuntime = async () => {
+  if (!isNativeMobileApp) {
+    return
+  }
+
+  try {
+    if (Capacitor.getPlatform() === 'ios') {
+      await StatusBar.setOverlaysWebView({ overlay: false })
+      await StatusBar.setStyle({ style: Style.Dark })
+      await StatusBar.setBackgroundColor({ color: '#b8860b' })
+    }
+    await Keyboard.setResizeMode({ mode: KeyboardResize.Body })
+    await SplashScreen.hide()
+  } catch {
+    // Ignore plugin errors to avoid breaking app startup on unsupported platforms.
+  }
+}
+
+void setupNativeMobileRuntime()
+
+const googleClientId = APP_CONFIG.googleClientId
+const googleIosClientId = APP_CONFIG.googleIosClientId
+if (isNativeMobileApp && googleClientId) {
+  void initializeNativeGoogleSignIn(
+  googleClientId,
+  googleIosClientId,
+).catch((error) => {
+  console.error('[GoogleAuth] Native initialization failed:', error)
+})
+    // The button retries initialization and presents any error to the user.
+
+}
+
+const appNode = (
+  <BrowserRouter>
+    <App />
+  </BrowserRouter>
+)
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    {googleClientId
+      ? (
+        <GoogleOAuthProvider clientId={googleClientId}>
+          {appNode}
+        </GoogleOAuthProvider>
+      )
+      : appNode}
+  </React.StrictMode>,
+)

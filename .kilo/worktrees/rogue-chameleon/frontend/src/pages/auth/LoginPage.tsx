@@ -1,0 +1,567 @@
+import { GoogleLogin, type CredentialResponse } from '@react-oauth/google'
+import type { FormEvent } from 'react'
+import { useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import { getErrorMessage, login, loginWithApple, loginWithGoogle } from '../../api'
+import { requestAppleSignInToken } from '../../appleAuth'
+import { APP_NAME, APP_TAGLINE } from '../../brand'
+import loginLogo from '../../assets/Filscoreclassic.png'
+import AuthProgressOverlay from '../../components/auth/AuthProgressOverlay'
+import { APP_CONFIG } from '../../config'
+import { getNativeGooglePlatform, isNativeGoogleSignIn, requestGoogleSignInToken } from '../../googleAuth'
+
+const FINANCIAL_HEALTH_PATH = '/financial-health-summary'
+const JOURNEY_MINIMIZED_STORAGE_KEY = 'fms:journey:minimized'
+const JOURNEY_DO_NOT_SHOW_STORAGE_KEY = 'fms:journey:do-not-show'
+
+function isMarkupPayload(value: string): boolean {
+  return /<\/?[a-z][^>]*>/i.test(value)
+}
+
+function getBackendErrorPayload(error: unknown): { status?: number; detail?: string } {
+  if (typeof error !== 'object' || error === null || !('response' in error)) {
+    return {}
+  }
+
+  const response = (error as {
+    response?: {
+      status?: unknown
+      data?: unknown
+    }
+  }).response
+
+  const status = typeof response?.status === 'number' ? response.status : undefined
+  const payload = response?.data
+
+  if (
+    typeof payload === 'string'
+    && payload.trim().length > 0
+    && !isMarkupPayload(payload)
+  ) {
+    return { status, detail: payload.trim() }
+  }
+
+  if (typeof payload !== 'object' || payload === null) {
+    return { status }
+  }
+
+  const candidate = payload as {
+    detail?: unknown
+    error?: unknown
+    message?: unknown
+  }
+
+  if (typeof candidate.detail === 'string' && candidate.detail.trim().length > 0) {
+    return { status, detail: candidate.detail.trim() }
+  }
+
+  if (Array.isArray(candidate.detail)) {
+    const firstString = candidate.detail.find((entry) => typeof entry === 'string')
+    if (typeof firstString === 'string' && firstString.trim().length > 0) {
+      return { status, detail: firstString.trim() }
+    }
+  }
+
+  if (typeof candidate.error === 'string' && candidate.error.trim().length > 0) {
+    return { status, detail: candidate.error.trim() }
+  }
+
+  if (typeof candidate.message === 'string' && candidate.message.trim().length > 0) {
+    return { status, detail: candidate.message.trim() }
+  }
+
+  return { status }
+}
+
+function resolveSocialAuthErrorMessage(
+  error: unknown,
+  fallback: string,
+  useThrownMessage = true,
+): string {
+  const { detail } = getBackendErrorPayload(error)
+  if (detail) {
+    return detail
+  }
+
+  if (typeof error === 'object' && error !== null) {
+    const candidate = error as { code?: unknown; message?: unknown }
+    const message = typeof candidate.message === 'string' ? candidate.message.toLowerCase() : ''
+    if (
+      candidate.code === 'ECONNABORTED'
+      || candidate.code === 'ETIMEDOUT'
+      || message.includes('timeout')
+      || message.includes('network error')
+    ) {
+      return 'The login provider is temporarily unavailable. Please try again shortly.'
+    }
+  }
+
+  if (useThrownMessage && error instanceof Error && error.message.trim().length > 0) {
+    return error.message
+  }
+
+  return getErrorMessage(error, fallback)
+}
+
+function isTrialExpiredMessage(message: string | undefined): boolean {
+  const normalized = (message || '').trim().toLowerCase()
+  if (!normalized) {
+    return false
+  }
+
+  return normalized.includes('expired due to non-payment')
+}
+
+function MailIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path
+        d="M3.75 6.75h16.5a1.5 1.5 0 0 1 1.5 1.5v7.5a3 3 0 0 1-3 3H5.25a3 3 0 0 1-3-3v-7.5a1.5 1.5 0 0 1 1.5-1.5Zm0 1.83v.28l8.25 5.08 8.25-5.08v-.28H3.75Zm16.5 1.87-7.46 4.59a1.5 1.5 0 0 1-1.58 0l-7.46-4.59v5.3a1.5 1.5 0 0 0 1.5 1.5h13.5a1.5 1.5 0 0 0 1.5-1.5v-5.3Z"
+        fill="currentColor"
+      />
+    </svg>
+  )
+}
+
+function LockIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path
+        d="M12 2.25a4.5 4.5 0 0 1 4.5 4.5v1.5h.75A2.25 2.25 0 0 1 19.5 10.5v8.25A2.25 2.25 0 0 1 17.25 21h-10.5A2.25 2.25 0 0 1 4.5 18.75V10.5A2.25 2.25 0 0 1 6.75 8.25h.75v-1.5A4.5 4.5 0 0 1 12 2.25Zm3 6V6.75a3 3 0 1 0-6 0v1.5h6Zm2.25 1.5h-10.5a.75.75 0 0 0-.75.75v8.25c0 .41.34.75.75.75h10.5c.41 0 .75-.34.75-.75V10.5a.75.75 0 0 0-.75-.75Zm-5.25 2.25a1.5 1.5 0 0 1 1.5 1.5c0 .63-.39 1.17-.94 1.39v1.36a.56.56 0 0 1-1.12 0v-1.36A1.5 1.5 0 0 1 10.5 13.5a1.5 1.5 0 0 1 1.5-1.5Z"
+        fill="currentColor"
+      />
+    </svg>
+  )
+}
+
+function EyeIcon({ open }: { open: boolean }) {
+  if (open) {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path
+          d="M12 5.25c4.94 0 8.23 4.2 9.36 5.88a1.5 1.5 0 0 1 0 1.74C20.23 14.55 16.94 18.75 12 18.75S3.77 14.55 2.64 12.87a1.5 1.5 0 0 1 0-1.74C3.77 9.45 7.06 5.25 12 5.25Zm0 1.5c-4.07 0-6.95 3.45-8.11 5.25 1.16 1.8 4.04 5.25 8.11 5.25s6.95-3.45 8.11-5.25c-1.16-1.8-4.04-5.25-8.11-5.25Zm0 2.25A3 3 0 1 1 9 12a3 3 0 0 1 3-3Zm0 1.5A1.5 1.5 0 1 0 13.5 12 1.5 1.5 0 0 0 12 10.5Z"
+          fill="currentColor"
+        />
+      </svg>
+    )
+  }
+
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path
+        d="m4.28 3.22 16.5 16.5-1.06 1.06-3.02-3.02A10.34 10.34 0 0 1 12 18.75c-4.94 0-8.23-4.2-9.36-5.88a1.5 1.5 0 0 1 0-1.74A16.84 16.84 0 0 1 7.1 6.63L3.22 2.72l1.06-1.06Zm3.9 4.96c-1.9 1.19-3.3 2.88-4.29 4.42 1.16 1.8 4.04 5.25 8.11 5.25 1.27 0 2.4-.34 3.38-.87l-2.01-2.01A3 3 0 0 1 9.03 10.6L8.18 9.74Zm3.3 1.18 2.6 2.6a1.5 1.5 0 0 0-2.6-2.6Zm.52-4.11c4.94 0 8.23 4.2 9.36 5.88a1.5 1.5 0 0 1 0 1.74 16.7 16.7 0 0 1-3.6 3.82l-1.08-1.08c1.51-1.08 2.64-2.46 3.43-3.69-1.16-1.8-4.04-5.25-8.11-5.25-.98 0-1.88.2-2.71.53l-1.2-1.2A8.82 8.82 0 0 1 12 5.25Z"
+        fill="currentColor"
+      />
+    </svg>
+  )
+}
+
+function GoogleMark() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="#EA4335" d="M12.24 10.29v3.95h5.49c-.24 1.27-.96 2.35-2.05 3.08l3.31 2.57c1.93-1.78 3.05-4.39 3.05-7.49 0-.71-.06-1.4-.18-2.06h-9.62Z" />
+      <path fill="#34A853" d="M12 22c2.76 0 5.07-.91 6.76-2.46l-3.31-2.57c-.92.62-2.1.99-3.45.99-2.65 0-4.89-1.79-5.69-4.19l-3.42 2.64A10 10 0 0 0 12 22Z" />
+      <path fill="#4A90E2" d="M6.31 13.77A5.99 5.99 0 0 1 6 12c0-.61.11-1.2.31-1.77L2.89 7.59A10 10 0 0 0 2 12c0 1.62.39 3.16 1.09 4.41l3.22-2.64Z" />
+      <path fill="#FBBC05" d="M12 6.04c1.5 0 2.84.52 3.89 1.53l2.91-2.91C17.06 3.05 14.75 2 12 2a10 10 0 0 0-8.91 5.59l3.42 2.64C7.11 7.83 9.35 6.04 12 6.04Z" />
+    </svg>
+  )
+}
+
+const APPLE_CONTINUE_BUTTON_URL =
+  'https://appleid.cdn-apple.com/appleid/button?color=black&border_radius=5&height=62&scale=2&type=continue&width=375'
+
+const LIFE_QUESTION_CARDS = [
+  { icon: '🏝', question: 'Can I retire at 50?', detail: 'Find out if it is possible.' },
+  { icon: '📊', question: 'Is my income in the global top 10%?', detail: 'See how you compare with the world.' },
+  { icon: '💛', question: "What's my Financial Health Score?", detail: 'Know where you stand.' },
+  { icon: '📋', question: 'Why is my loan application always rejected?', detail: 'Find out the possible reasons.' },
+  { icon: '🪙', question: 'What could my net worth be at 60?', detail: 'Plan for a richer future.' },
+  { icon: '📈', question: 'Am I saving enough?', detail: "See if you're on track." },
+] as const
+
+export default function LoginPage() {
+  const navigate = useNavigate()
+  const googleClientId = APP_CONFIG.googleClientId
+  const googleIosClientId = APP_CONFIG.googleIosClientId
+  const useNativeGoogleSignIn = isNativeGoogleSignIn()
+  const appleClientId = APP_CONFIG.appleClientId
+  const appleIosClientId = APP_CONFIG.appleIosClientId
+  const appleRedirectUri = APP_CONFIG.appleRedirect
+  const isGoogleConfigured = googleClientId.length > 0
+  const isGoogleEnabled = isGoogleConfigured
+  const isAppleConfigured = appleClientId.length > 0
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [message, setMessage] = useState('')
+  const [isSaving, setIsSaving] = useState(false)
+  const [showPassword, setShowPassword] = useState(false)
+  const [rememberMe, setRememberMe] = useState(false)
+  const [showEmailLogin, setShowEmailLogin] = useState(false)
+  const openFinancialHealthJourney = () => {
+    window.localStorage.removeItem(JOURNEY_MINIMIZED_STORAGE_KEY)
+    window.localStorage.removeItem(JOURNEY_DO_NOT_SHOW_STORAGE_KEY)
+    navigate(FINANCIAL_HEALTH_PATH, { replace: true })
+  }
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setIsSaving(true)
+    setMessage('')
+
+    try {
+      const result = await login({ username, password, rememberMe })
+      if (!result.user.isActive) {
+        const account = encodeURIComponent(username.trim())
+        navigate(account ? `/trial-expired?source=login&account=${account}` : '/trial-expired?source=login')
+        return
+      }
+      openFinancialHealthJourney()
+    } catch (error) {
+      const { status } = getBackendErrorPayload(error)
+      if (status === 404) {
+        navigate('/register', {
+          replace: true,
+          state: {
+            registrationMethod: 'email',
+            email: username.trim(),
+          },
+        })
+        return
+      }
+
+      const resolvedMessage = resolveSocialAuthErrorMessage(error, 'Unable to sign in right now.', false)
+      if (isTrialExpiredMessage(resolvedMessage)) {
+        const account = encodeURIComponent(username.trim())
+        navigate(account ? `/trial-expired?source=login&account=${account}` : '/trial-expired?source=login')
+        return
+      }
+
+      setMessage(resolvedMessage)
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const handleGoogleSuccess = async (response: CredentialResponse, platform: 'web' | 'ios' | 'android' = 'web') => {
+    const idToken = response.credential
+    if (!idToken) {
+      setMessage('Google sign-in did not return a valid credential.')
+      return
+    }
+
+    setIsSaving(true)
+    setMessage('')
+    try {
+      const result = await loginWithGoogle({
+        idToken,
+        platform,
+        rememberMe,
+      })
+      if (!result.user.isActive) {
+        navigate('/trial-expired?source=google')
+        return
+      }
+      openFinancialHealthJourney()
+    } catch (error) {
+      const { status, detail } = getBackendErrorPayload(error)
+      if (
+        status === 400 &&
+        typeof detail === 'string' &&
+        (
+          detail.toLowerCase().includes('first-time google sign-in') ||
+          detail.toLowerCase().includes('data-sharing preference')
+        )
+      ) {
+        navigate('/register', { replace: true, state: { socialProvider: 'google' } })
+        return
+      }
+
+      if (isTrialExpiredMessage(detail)) {
+        navigate('/trial-expired?source=google')
+        return
+      }
+
+      setMessage(resolveSocialAuthErrorMessage(error, 'Unable to sign in with Google right now.'))
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const handleNativeGoogleSignIn = async () => {
+    setIsSaving(true)
+    setMessage('')
+    try {
+      const idToken = await requestGoogleSignInToken(
+        googleClientId,
+        googleIosClientId,
+      )
+      await handleGoogleSuccess({ credential: idToken }, getNativeGooglePlatform())
+    } catch (error) {
+      setMessage(resolveSocialAuthErrorMessage(error, 'Unable to sign in with Google right now.'))
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const handleAppleSignIn = async () => {
+    if (!isAppleConfigured) {
+      setMessage('Apple Sign-In is available when configured.')
+      return
+    }
+
+    setIsSaving(true)
+    setMessage('')
+
+    try {
+      const appleTokenResult = await requestAppleSignInToken({
+        clientId: appleClientId,
+        iosClientId: appleIosClientId,
+        redirectURI: appleRedirectUri,
+      })
+
+      const result = await loginWithApple({
+        idToken: appleTokenResult.idToken,
+        rememberMe,
+      })
+      if (!result.user.isActive) {
+        navigate('/trial-expired?source=apple')
+        return
+      }
+      openFinancialHealthJourney()
+    } catch (error) {
+      const { status, detail } = getBackendErrorPayload(error)
+      if (
+        status === 400 &&
+        typeof detail === 'string' &&
+        (
+          detail.toLowerCase().includes('first-time apple sign-in') ||
+          detail.toLowerCase().includes('data-sharing preference')
+        )
+      ) {
+        navigate('/register', { replace: true, state: { socialProvider: 'apple' } })
+        return
+      }
+
+      if (isTrialExpiredMessage(detail)) {
+        navigate('/trial-expired?source=apple')
+        return
+      }
+
+      setMessage(resolveSocialAuthErrorMessage(error, 'Unable to sign in with Apple right now.'))
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  return (
+    <div className="login-art-page">
+      <div className="login-art-shell">
+        <div className="login-art-brand">
+          <img className="login-art-logo" src={loginLogo} alt={APP_NAME} />
+          <div className="login-art-brand-copy">
+            <p className="login-art-brand-name">{APP_NAME}</p>
+            <p className="login-art-brand-tagline">{APP_TAGLINE}</p>
+          </div>
+        </div>
+
+        <div className="login-art-card">
+          <div className="login-art-social-stack" aria-live="polite">
+            <section className="login-life-questions" aria-labelledby="login-life-questions-title">
+              <h1 id="login-life-questions-title">Get Answers to Life’s Important Questions</h1>
+              <div className="login-life-questions-grid">
+                {LIFE_QUESTION_CARDS.map((item) => (
+                  <article key={item.question}>
+                    <span className="login-life-question-icon" aria-hidden="true">{item.icon}</span>
+                    <span>
+                      <strong>{item.question}</strong>
+                      <small>{item.detail}</small>
+                    </span>
+                  </article>
+                ))}
+              </div>
+              <p>Your financial answers are waiting.</p>
+            </section>
+
+            <Link
+              to="/financial-health-journey"
+              className="login-art-social-button login-art-social-button-apple login-art-free-access-button"
+            >
+              Access FILSCORE Free
+            </Link>
+
+            <div className="login-art-new-user">
+              <span>New user?</span>
+              <Link to="/register">Create Account</Link>
+            </div>
+
+            <button
+              type="button"
+              className="login-art-social-button login-art-official-apple-button"
+              aria-label="Continue with Apple"
+              onClick={() => {
+                void handleAppleSignIn()
+              }}
+              disabled={isSaving || !isAppleConfigured}
+            >
+              <img
+                className="login-art-official-apple-image"
+                src={APPLE_CONTINUE_BUTTON_URL}
+                alt=""
+                aria-hidden="true"
+              />
+            </button>
+
+            <div className="login-art-google-wrap">
+              {isGoogleEnabled && useNativeGoogleSignIn ? (
+                <button
+                  type="button"
+                  className="login-art-social-button login-art-provider-button login-art-google-button"
+                  onClick={() => void handleNativeGoogleSignIn()}
+                  disabled={isSaving}
+                >
+                  <span className="login-art-social-icon login-art-google-icon"><GoogleMark /></span>
+                  <span>Continue with Google</span>
+                </button>
+              ) : null}
+              {isGoogleEnabled && !useNativeGoogleSignIn ? (
+                <div className="login-art-google-live">
+                  <div className="login-art-google-preview" aria-hidden="true">
+                    <span className="login-art-social-icon login-art-google-icon"><GoogleMark /></span>
+                    <span>Continue with Google</span>
+                  </div>
+                  <GoogleLogin
+                    onSuccess={(response) => handleGoogleSuccess(response, 'web')}
+                    onError={() => setMessage('Unable to load Google Sign-In right now. Please try again.')}
+                    text="continue_with"
+                    size="large"
+                    theme="filled_black"
+                    shape="rectangular"
+                    width="375"
+                  />
+                </div>
+              ) : null}
+            </div>
+
+            {!isGoogleEnabled ? (
+              <p className="login-art-service-note">Google Sign-In is available when configured.</p>
+            ) : null}
+            {!isAppleConfigured ? (
+              <p className="login-art-service-note">Apple Sign-In is available when configured.</p>
+            ) : null}
+
+            {!showEmailLogin ? (
+              <button
+                type="button"
+                className="login-art-social-button login-art-social-button-email login-art-provider-button"
+                onClick={() => setShowEmailLogin(true)}
+                aria-controls="login-email-form"
+                aria-expanded="false"
+              >
+                <span className="login-art-social-icon">
+                  <MailIcon />
+                </span>
+                <span>Other Email</span>
+              </button>
+            ) : null}
+          </div>
+
+          {showEmailLogin ? (
+            <>
+              <div className="login-art-divider" aria-hidden="true">
+                <span>or</span>
+              </div>
+
+              <form id="login-email-form" className="login-art-form" onSubmit={handleSubmit}>
+                <label className="login-art-field">
+                  <span className="login-art-field-icon">
+                    <MailIcon />
+                  </span>
+                  <input
+                    value={username}
+                    onChange={(event) => setUsername(event.target.value)}
+                    autoComplete="username"
+                    placeholder="Email or username"
+                    className="login-art-input"
+                    required
+                  />
+                </label>
+
+                <label className="login-art-field">
+                  <span className="login-art-field-icon">
+                    <LockIcon />
+                  </span>
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    autoComplete="current-password"
+                    placeholder="Password"
+                    className="login-art-input"
+                    required
+                  />
+                  <button
+                    type="button"
+                    className="login-art-visibility-toggle"
+                    onClick={() => setShowPassword((previous) => !previous)}
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  >
+                    <EyeIcon open={showPassword} />
+                  </button>
+                </label>
+
+                <label className="login-art-remember">
+                  <input
+                    type="checkbox"
+                    checked={rememberMe}
+                    onChange={(event) => setRememberMe(event.target.checked)}
+                  />
+                  <span>
+                    <strong>Remember me</strong>
+                    <small>Keep me signed in on this device.</small>
+                  </span>
+                </label>
+
+                <button type="submit" className="login-art-submit" disabled={isSaving}>
+                  {isSaving ? 'Signing In...' : 'Log In'}
+                </button>
+              </form>
+            </>
+          ) : null}
+
+          {message ? <p className="login-art-message status-error">{message}</p> : null}
+
+          {showEmailLogin ? (
+            <Link className="login-art-forgot" to="/forgot-password">
+              Forgot Password?
+            </Link>
+          ) : null}
+
+          <div className="login-art-support-links">
+            <Link to="/account">Account Settings</Link>
+            <Link to="/fees">Fees</Link>
+            <Link to="/privacy">Privacy</Link>
+            <Link to="/terms">Terms</Link>
+            <Link to="/about-filscore">About</Link>
+            <Link to="/return-refund-policy">Returns &amp; Refunds</Link>
+            <Link to="/customer-service">Customer Service</Link>
+            <Link to="/dispute-resolution">Dispute Resolution</Link>
+          </div>
+        </div>
+      </div>
+
+      {isSaving ? (
+        <AuthProgressOverlay
+          idPrefix="login-signing"
+          kicker="Secure access"
+          title="Signing you in"
+          orbitLabels={['Financial Health', 'Credit Worthy', 'Networth Growth']}
+          description="Verifying your account and preparing your financial health dashboard."
+          footnote="Please keep this window open."
+        />
+      ) : null}
+
+    </div>
+  )
+}
+
+

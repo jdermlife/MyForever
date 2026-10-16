@@ -1,0 +1,124 @@
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from app.database import get_db
+from app.models.users import AuthSession, User
+from app.services.account_access_service import deactivate_if_access_expired
+import security.auth as token_auth
+
+
+AUTH_REQUIRED = os.getenv("ENFORCE_AUTH", "true").lower() == "true"
+ADMIN_USERNAME_OVERRIDE = "admin123"
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+@dataclass
+class CurrentUser:
+    id: int
+    username: str
+    role: str
+    issued_at: float = 0
+    auth_provider: str | None = None
+    session_jti: str | None = None
+
+
+def is_admin_username_override(username: str | None) -> bool:
+    return (username or "").strip().lower() == ADMIN_USERNAME_OVERRIDE
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> CurrentUser | None:
+    if credentials is None:
+        if AUTH_REQUIRED:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Please Login.",
+            )
+        return None
+
+    try:
+        payload = token_auth.decode_token(credentials.credentials)
+    except token_auth.TokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication is not configured",
+        ) from exc
+
+    resolved_role = "admin" if is_admin_username_override(payload.username) else payload.role
+
+    return CurrentUser(
+        id=payload.sub,
+        username=payload.username,
+        role=resolved_role,
+        issued_at=payload.iat,
+        auth_provider=payload.auth_provider,
+        session_jti=payload.session_jti,
+    )
+
+
+def require_authenticated_user(
+    user: CurrentUser | None = Depends(get_current_user),
+    db=Depends(get_db),
+) -> CurrentUser:
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+    db_user = db.query(User).filter(User.id == user.id).first()
+    if db_user is None or db_user.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is unavailable",
+        )
+    if user.session_jti:
+        sessions = db.query(AuthSession).filter(AuthSession.jti == user.session_jti).all()
+        session = next(
+            (candidate for candidate in sessions if candidate.jti == user.session_jti),
+            None,
+        )
+        if (
+            session is None
+            or session.user_id != user.id
+            or session.revoked_at is not None
+            or session.expires_at <= datetime.now(timezone.utc)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication session is invalid or revoked",
+            )
+    if deactivate_if_access_expired(db_user):
+        db.commit()
+    if not db_user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Free trial and 24-hour payment grace period expired due to non-payment. Complete payment to reactivate access.",
+        )
+
+    return user
+
+
+def require_roles(*allowed_roles: str):
+    allowed = {role.strip().lower() for role in allowed_roles if role.strip()}
+
+    def dependency(user: CurrentUser = Depends(require_authenticated_user)) -> CurrentUser:
+        if allowed and user.role.lower() not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+        return user
+
+    return dependency

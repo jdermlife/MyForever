@@ -1,0 +1,429 @@
+"""
+Integration test for QuantScores compute endpoint.
+
+Tests the complete flow:
+1. POST to /api/loan-applications/compute-quant-scores
+2. Verify response contains correct quant_scores summary
+3. Verify scores are persisted to database
+4. GET /api/loan-applications/{app_no} and verify persisted scores
+
+NOTE: These tests assume the database is initialized with the full schema.
+Use with actual database, not test fixtures, due to complex foreign key relationships.
+"""
+
+import pytest
+from fastapi.testclient import TestClient
+from fastapi import FastAPI
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, sessionmaker
+from types import SimpleNamespace
+from uuid import uuid4
+
+from app.database import SessionLocal
+from app.fastapi_auth import CurrentUser, require_authenticated_user
+from app.routes import loan_routes
+from app.routes.loan_routes import router as loan_router
+from app.models.loan_application import LoanApplication
+
+
+class FakeQuery:
+    def filter(self, *_criteria):
+        return self
+
+    def first(self):
+        return None
+
+
+class FakeSession:
+    def __init__(self):
+        self.next_id = 1
+
+    def query(self, _model):
+        return FakeQuery()
+
+    def add(self, record):
+        if getattr(record, "id", None) is None:
+            record.id = self.next_id
+            self.next_id += 1
+
+    def execute(self, *_args, **_kwargs):
+        raise RuntimeError("workflow history is unavailable in the route test session")
+
+    def begin_nested(self):
+        class NestedTransaction:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        return NestedTransaction()
+
+    def flush(self):
+        return None
+
+    def commit(self):
+        return None
+
+    def refresh(self, _record):
+        return None
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+
+@pytest.fixture
+def client(monkeypatch):
+    """Create an authenticated endpoint client isolated from local database state."""
+    monkeypatch.setattr(loan_routes, "SessionLocal", FakeSession)
+    monkeypatch.setattr(
+        loan_routes,
+        "evaluate_loan_record_create_entitlement",
+        lambda *_args: {"allowed": True},
+    )
+    app = FastAPI()
+    app.include_router(loan_router, prefix="/api")
+    app.dependency_overrides[require_authenticated_user] = lambda: CurrentUser(
+        id=1001,
+        username="subscriber_test",
+        role="SUBSCRIBER",
+    )
+    return TestClient(app)
+
+
+@pytest.fixture
+def subscriber_headers():
+    return {}
+
+
+def get_test_payload():
+    """Return a valid LoanApplicationCreate payload with all required fields."""
+    return {
+        "application_no": f"APP-TEST-{uuid4().hex[:8].upper()}",
+        "status": "DRAFT",
+        "product_type": "Auto Loan",
+        "borrower_name": "Test Borrower",
+        "email": "test@example.com",
+        "phone": "555-1234",
+        "gov_id": "123456789",
+        "address": "123 Main St, Test City, TC 12345",
+        "monthly_income": 10000.0,
+        "other_income": 0.0,
+        "debt_obligations": 2000.0,
+        "loan_amount": 450000.0,
+        "term_months": 36,
+        "interest_rate": 12.5,
+        "purpose": "HOME",
+        "vehicle_info": "N/A",
+        "appraised_value": 500000.0,
+        "committee_remarks": "Automated test",
+        "executive_approval": False,
+        "dti": 0.2,
+        "dsr": 0.35,
+        "ltv": 0.9,
+        "scorecard_total": 0,
+        "ai_probability": 0.0,
+        "requirements": {
+            "applicantPersonal": {
+                "maritalStatus": "Single",
+                "numberOfDependents": 0,
+            },
+            "bankingRelationships": {
+                "currentBalance": 150000,
+                "accountNumber": "001",
+                "creditCardNumber": "CC-1",
+                "creditLimit": 200000,
+                "outstandingBalance": 40000,
+                "memberSince": "2020-01-01",
+                "loanLender": "Bank A",
+            },
+            "supportingDocuments": {
+                "utilityBill": True,
+                "bankStatements": True,
+            },
+            "enhancedDueDiligence": {
+                "numberOfActiveLoans": 1,
+            },
+            "employmentInformation": {
+                "employmentStatus": "Locally Employed",
+                "totalYearsWorking": "5",
+                "dateHired": "2020-01-01",
+                "monthlyLivingExpenses": 25000,
+            },
+            "addressInformation": {
+                "lengthOfStay": "5 years",
+            },
+            "collateralAssetDetails": {
+                "brand": "Toyota",
+                "year": "2026",
+                "assetType": "Passenger vehicle",
+                "appraisedValue": 1800000,
+            },
+            "productInformation": {
+                "autoSellingPrice": 1800000,
+                "autoVehicleClassification": "Passenger vehicle",
+                "autoYearModel": "2026",
+            },
+        },
+    }
+
+
+def test_compute_quant_scores_returns_200_with_summary(client, subscriber_headers):
+    """Test POST endpoint returns 200 with complete quant_scores summary."""
+    response = client.post(
+        "/api/loan-applications/compute-quant-scores",
+        json=get_test_payload(),
+        headers=subscriber_headers,
+    )
+
+    if response.status_code != 200:
+        print(f"Response status: {response.status_code}")
+        print(f"Response body: {response.json()}")
+
+    assert response.status_code == 200
+    data = response.json()
+
+    # Verify response structure
+    assert "message" in data
+    assert "application_no" in data
+    assert "quant_scores" in data
+    assert data["persisted"] is True
+
+    # Verify quant_scores summary contains all required fields
+    summary = data["quant_scores"]
+    assert "creditScore" in summary
+    assert "fraudScore" in summary
+    assert "socialScore" in summary
+    assert "psychometricScore" in summary
+    assert "relationshipScore" in summary
+    assert "profitabilityScore" in summary
+    assert "overallScore" in summary
+    assert "compositeScore" in summary
+    assert "finalGrade" in summary
+    assert "finalRating" in summary
+    assert "decision" in summary
+
+    # Verify types and ranges
+    assert isinstance(summary["creditScore"], (int, float))
+    assert isinstance(summary["fraudScore"], (int, float))
+    assert isinstance(summary["overallScore"], (int, float))
+    assert isinstance(summary["compositeScore"], (int, float))
+    assert isinstance(summary["finalGrade"], str)
+    assert isinstance(summary["finalRating"], str)
+    assert summary["finalGrade"] in ["A++", "A+", "A", "B+", "B", "C+", "C", "D", "F"]
+    assert summary["decision"] in ["APPROVE", "REVIEW", "DECLINE"]
+
+
+def test_compute_quant_scores_persists_to_database(client, subscriber_headers):
+    """Test that computed scores are persisted to database.
+    
+    SKIPPED: Requires active database connection with initialized schema.
+    Run manually against staging/production database for full validation.
+    """
+    pytest.skip("Database persistence requires active PostgreSQL connection")
+
+
+def test_get_loan_retrieves_persisted_scores(client, subscriber_headers):
+    """Test that GET endpoint retrieves the persisted scores.
+    
+    SKIPPED: Requires active database connection with initialized schema.
+    Run manually against staging/production database for full validation.
+    """
+    pytest.skip("Database retrieval requires active PostgreSQL connection")
+
+
+def test_compute_quant_scores_deterministic_values(client, subscriber_headers):
+    """Test that product-aware scoring returns the expected deterministic summary."""
+    response = client.post(
+        "/api/loan-applications/compute-quant-scores",
+        json=get_test_payload(),
+        headers=subscriber_headers,
+    )
+
+    assert response.status_code == 200
+    summary = response.json()["quant_scores"]
+
+    assert summary["creditScore"] == 49
+    assert summary["fraudScore"] == 55
+    assert summary["socialScore"] == 39
+    assert summary["psychometricScore"] == 0
+    assert summary["relationshipScore"] == 88
+    assert summary["profitabilityScore"] == 79
+    assert summary["overallScore"] == 50
+    assert summary["compositeScore"] == 500
+    assert summary["finalGrade"] == "F"
+    assert summary["finalRating"] == "Critical"
+    assert summary["decision"] == "DECLINE"
+
+
+def test_compute_quant_scores_missing_required_fields(client, subscriber_headers):
+    """Test that endpoint handles missing required fields gracefully."""
+    invalid_payload = {
+        "borrower_name": "Test User",
+        # Missing required fields like application_no, status, etc.
+    }
+    response = client.post(
+        "/api/loan-applications/compute-quant-scores",
+        json=invalid_payload,
+        headers=subscriber_headers,
+    )
+
+    # Should return 422 (validation error) 
+    assert response.status_code == 422
+
+
+def test_compute_quant_scores_returns_rating_when_persistence_fails(monkeypatch):
+    class FailingCommitSession(FakeSession):
+        def commit(self):
+            raise OperationalError("COMMIT", {}, RuntimeError("database schema is outdated"))
+
+    monkeypatch.setattr(loan_routes, "SessionLocal", FailingCommitSession)
+    monkeypatch.setattr(
+        loan_routes,
+        "evaluate_loan_record_create_entitlement",
+        lambda *_args: {"allowed": True},
+    )
+    app = FastAPI()
+    app.include_router(loan_router, prefix="/api")
+    app.dependency_overrides[require_authenticated_user] = lambda: CurrentUser(
+        id=1001,
+        username="subscriber_test",
+        role="SUBSCRIBER",
+    )
+
+    response = TestClient(app).post(
+        "/api/loan-applications/compute-quant-scores",
+        json=get_test_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["persisted"] is False
+    assert response.json()["quant_scores"]["finalRating"] == "Critical"
+
+
+def test_workflow_history_failure_does_not_abort_score_transaction():
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE score_commits (id INTEGER PRIMARY KEY)"))
+
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    try:
+        loan_routes.append_workflow_history_entry(
+            db,
+            SimpleNamespace(id=1),
+            previous_status=None,
+            new_status="DRAFT",
+            user=CurrentUser(id=1001, username="subscriber_test", role="SUBSCRIBER"),
+        )
+        db.execute(text("INSERT INTO score_commits (id) VALUES (1)"))
+        db.commit()
+
+        persisted = db.execute(text("SELECT id FROM score_commits")).scalar_one()
+        assert persisted == 1
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_workflow_history_serializes_metadata_for_database_driver():
+    class RecordingSession:
+        parameters = None
+
+        def begin_nested(self):
+            class NestedTransaction:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+            return NestedTransaction()
+
+        def execute(self, _statement, parameters):
+            self.parameters = parameters
+
+    db = RecordingSession()
+    loan_routes.append_workflow_history_entry(
+        db,
+        SimpleNamespace(id=1),
+        previous_status=None,
+        new_status="DRAFT",
+        user=CurrentUser(id=1001, username="subscriber_test", role="SUBSCRIBER"),
+    )
+
+    assert db.parameters is not None
+    assert db.parameters["metadata"] == "{}"
+
+
+def test_recompute_stored_quant_scores_uses_persisted_record(monkeypatch):
+    application_no = "APP-STORED-1"
+    payload = get_test_payload()
+    payload["application_no"] = application_no
+    payload["requirements"]["buildProfile"] = {
+        "profileId": application_no,
+        "values": {"financialGoal": "Build Emergency Fund"},
+    }
+    record = SimpleNamespace(
+        application_no=application_no,
+        scorecard_total=0,
+        ai_probability=0.0,
+        updated_by=None,
+    )
+
+    class FakeSession:
+        committed = False
+        refreshed = False
+
+        def commit(self):
+            self.committed = True
+
+        def refresh(self, refreshed_record):
+            assert refreshed_record is record
+            self.refreshed = True
+
+        def rollback(self):
+            raise AssertionError("Recompute should not roll back")
+
+        def close(self):
+            pass
+
+    session = FakeSession()
+    persisted = {}
+    monkeypatch.setattr(loan_routes, "SessionLocal", lambda: session)
+    monkeypatch.setattr(
+        loan_routes,
+        "get_loan_application_or_404",
+        lambda _db, requested_no: record if requested_no == application_no else None,
+    )
+    monkeypatch.setattr(loan_routes, "enforce_loan_application_access", lambda *_args: None)
+    monkeypatch.setattr(loan_routes, "serialize_loan_application", lambda _record: payload)
+    monkeypatch.setattr(
+        loan_routes,
+        "persist_score_details",
+        lambda _db, _record, scored_data: persisted.update(
+            requirements=scored_data.requirements,
+            overall_scores=scored_data.overall_scores,
+        ),
+    )
+    monkeypatch.setattr(loan_routes, "invalidate_dashboard_statistics_cache", lambda: None)
+
+    result = loan_routes.recompute_stored_quant_scores(
+        application_no,
+        SimpleNamespace(id=42, username="tester", role="Subscriber"),
+    )
+
+    assert session.committed is True
+    assert session.refreshed is True
+    assert record.updated_by == 42
+    assert persisted["requirements"]["buildProfile"]["profileId"] == application_no
+    assert persisted["overall_scores"]["final_score"] == result["quant_scores"]["overallScore"]
+    assert result["application_no"] == application_no
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

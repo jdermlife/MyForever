@@ -1,0 +1,2004 @@
+import axios, { AxiosError, AxiosResponse } from 'axios'
+import { Capacitor } from '@capacitor/core'
+
+import { clearAutosaveDraftsForToken } from './autosave/draftStorage'
+import { APP_CONFIG } from './config'
+
+const AUTH_TOKEN_STORAGE_KEY = 'auth_token'
+const REFRESH_TOKEN_STORAGE_KEY = 'refresh_token'
+const CURRENT_USER_SESSION_STORAGE_KEY = 'fms:auth:current-user'
+const AUTH_REQUEST_TIMEOUT_MS = 12000
+const LOGIN_PROVIDER_TIMEOUT_MS = 4000
+const LOGOUT_REVOCATION_TIMEOUT_MS = 3000
+const LOGIN_PROVIDER_CACHE_KEY = 'fms:auth:login-provider'
+
+type AuthStorageMode = 'persistent' | 'session'
+
+const isDevelopment = import.meta.env.DEV
+const apiBaseUrlCandidates = Array.from(new Set([
+  APP_CONFIG.apiBase,
+  APP_CONFIG.apiFallbackBase,
+].filter((candidate): candidate is string => Boolean(candidate))))
+
+function normalizeLoginProviderBase(candidate: string): string | null {
+  try {
+    const baseOrigin = typeof window === 'undefined' ? undefined : window.location.origin
+    const url = new URL(candidate, baseOrigin)
+    if (!['http:', 'https:'].includes(url.protocol)) return null
+    if (url.pathname === '/api' || url.pathname === '/api/') url.pathname = '/'
+    url.search = ''
+    url.hash = ''
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    return null
+  }
+}
+
+function getLoginProviderCandidates(): string[] {
+  const configuredCandidates = apiBaseUrlCandidates
+    .map(normalizeLoginProviderBase)
+    .filter((candidate): candidate is string => Boolean(candidate))
+  const sameOrigin = typeof window !== 'undefined' && !isDevelopment && !Capacitor.isNativePlatform()
+    ? normalizeLoginProviderBase(window.location.origin)
+    : null
+  const allowedCandidates = Array.from(new Set([
+    sameOrigin,
+    ...configuredCandidates,
+  ].filter((candidate): candidate is string => Boolean(candidate))))
+
+  let cachedProvider: string | null = null
+  if (typeof window !== 'undefined') {
+    try {
+      const cached = JSON.parse(window.localStorage.getItem(LOGIN_PROVIDER_CACHE_KEY) || 'null') as {
+        baseUrl?: unknown
+      } | null
+      if (typeof cached?.baseUrl === 'string' && allowedCandidates.includes(cached.baseUrl)) {
+        cachedProvider = cached.baseUrl
+      }
+    } catch {
+      try {
+        window.localStorage.removeItem(LOGIN_PROVIDER_CACHE_KEY)
+      } catch {
+        // Login must continue when browser storage is unavailable.
+      }
+    }
+  }
+
+  return Array.from(new Set([
+    cachedProvider,
+    ...allowedCandidates,
+  ].filter((candidate): candidate is string => Boolean(candidate))))
+}
+
+function cacheLoginProvider(baseUrl: string): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(LOGIN_PROVIDER_CACHE_KEY, JSON.stringify({
+      baseUrl,
+      updatedAt: new Date().toISOString(),
+    }))
+  } catch {
+    // Provider caching is an optimization and must never block login.
+  }
+}
+
+const healthCheckClient = axios.create({
+  timeout: 6000,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+})
+
+let activeApiBaseUrl =
+  apiBaseUrlCandidates.length > 0
+    ? apiBaseUrlCandidates[0]
+    : APP_CONFIG.apiBase
+
+export const api = axios.create({
+  baseURL: activeApiBaseUrl,
+  timeout: 60000,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+})
+
+export type ProfileHistoryCategory =
+  | 'budget_snapshot'
+  | 'net_worth_snapshot'
+  | 'wealth_building_score'
+  | 'financial_health_score'
+  | 'credit_health_score'
+  | 'bill_payment'
+  | 'loan_monitoring'
+  | 'goal_tracking'
+  | 'ai_recommendation'
+  | 'certification'
+  | 'risk_assessment'
+
+export interface ProfileHistoryRecord {
+  id: number
+  application_no: string
+  category: ProfileHistoryCategory
+  observed_at: string
+  payload: unknown
+  created_at: string
+}
+
+export interface ProfileHistoryList {
+  items: ProfileHistoryRecord[]
+  total: number
+}
+
+export async function listProfileHistory(
+  applicationNo: string,
+  category?: ProfileHistoryCategory,
+  limit = 100,
+): Promise<ProfileHistoryList> {
+  const response = await api.get<ProfileHistoryList>(
+    `/api/profiles/${encodeURIComponent(applicationNo)}/history`,
+    { params: { category, limit } },
+  )
+  return response.data
+}
+
+export async function createProfileHistory(
+  applicationNo: string,
+  payload: {
+    category: ProfileHistoryCategory
+    observed_at: string
+    payload: unknown
+  },
+): Promise<ProfileHistoryRecord> {
+  const response = await api.post<ProfileHistoryRecord>(
+    `/api/profiles/${encodeURIComponent(applicationNo)}/history`,
+    payload,
+  )
+  return response.data
+}
+
+function setActiveApiBaseUrl(url: string): void {
+  if (activeApiBaseUrl === url) {
+    return
+  }
+
+  activeApiBaseUrl = url
+  api.defaults.baseURL = url
+}
+
+async function findHealthyApiBaseUrl(): Promise<string | null> {
+  for (const candidate of apiBaseUrlCandidates) {
+    try {
+      const response = await healthCheckClient.get('/api/health', {
+        baseURL: candidate,
+      })
+
+      if (response.status === 200) {
+        return candidate
+      }
+    } catch {
+      // Try the next configured backend URL.
+    }
+  }
+
+  return null
+}
+
+let authToken: string | null = null
+let refreshToken: string | null = null
+let currentUserCache: AuthUser | null = null
+let currentUserRequest: Promise<AuthUser> | null = null
+let refreshTokenRequest: Promise<string> | null = null
+let authStorageMode: AuthStorageMode = 'persistent'
+
+function clearCachedAuthState() {
+  currentUserCache = null
+  currentUserRequest = null
+
+  if (typeof window !== 'undefined') {
+    window.sessionStorage.removeItem(CURRENT_USER_SESSION_STORAGE_KEY)
+  }
+}
+
+function storeCurrentUser(user: AuthUser): AuthUser {
+  currentUserCache = user
+
+  if (typeof window !== 'undefined' && authToken) {
+    window.sessionStorage.setItem(CURRENT_USER_SESSION_STORAGE_KEY, JSON.stringify({
+      accessToken: authToken,
+      user,
+    }))
+  }
+
+  return user
+}
+
+function restoreCurrentUserFromSession(accessToken: string): void {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  try {
+    const storedValue = window.sessionStorage.getItem(CURRENT_USER_SESSION_STORAGE_KEY)
+    if (!storedValue) {
+      return
+    }
+
+    const stored = JSON.parse(storedValue) as {
+      accessToken?: unknown
+      user?: Record<string, unknown>
+    }
+    if (stored.accessToken !== accessToken || !stored.user) {
+      clearCachedAuthState()
+      return
+    }
+
+    currentUserCache = normalizeAuthUser(stored.user)
+  } catch {
+    clearCachedAuthState()
+  }
+}
+
+function isBrowserReload(): boolean {
+  if (typeof window === 'undefined') {
+    return false
+  }
+
+  return window.performance
+    .getEntriesByType('navigation')
+    .some((entry) => (entry as PerformanceNavigationTiming).type === 'reload')
+}
+
+function syncStoredSession(
+  nextAccessToken: string | null,
+  nextRefreshToken: string | null,
+  storageMode: AuthStorageMode = authStorageMode,
+) {
+  authToken = nextAccessToken
+  refreshToken = nextRefreshToken
+  authStorageMode = storageMode
+
+  if (nextAccessToken) {
+    api.defaults.headers.common['Authorization'] = `Bearer ${nextAccessToken}`
+  } else {
+    delete api.defaults.headers.common['Authorization']
+    clearCachedAuthState()
+  }
+
+  if (typeof window !== 'undefined') {
+    localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY)
+    localStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY)
+    sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY)
+    sessionStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY)
+
+    const storage = storageMode === 'persistent' ? localStorage : sessionStorage
+    if (nextAccessToken) {
+      storage.setItem(AUTH_TOKEN_STORAGE_KEY, nextAccessToken)
+    }
+
+    if (nextRefreshToken) {
+      storage.setItem(REFRESH_TOKEN_STORAGE_KEY, nextRefreshToken)
+    }
+  }
+}
+
+export function setAuthToken(token: string | null) {
+  syncStoredSession(token, token ? refreshToken : null)
+}
+
+export function getAuthToken(): string | null {
+  if (typeof window !== 'undefined' && !authToken) {
+    authToken = sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY) ?? localStorage.getItem(AUTH_TOKEN_STORAGE_KEY)
+  }
+  return authToken
+}
+
+export function getRefreshToken(): string | null {
+  if (typeof window !== 'undefined' && !refreshToken) {
+    refreshToken = sessionStorage.getItem(REFRESH_TOKEN_STORAGE_KEY) ?? localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY)
+  }
+  return refreshToken
+}
+
+// Initialize token from storage on load
+if (typeof window !== 'undefined' && typeof localStorage?.getItem === 'function') {
+  const sessionAuthToken = sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY)
+  const sessionRefreshToken = sessionStorage.getItem(REFRESH_TOKEN_STORAGE_KEY)
+  const storedAuthToken = sessionAuthToken ?? localStorage.getItem(AUTH_TOKEN_STORAGE_KEY)
+  const storedRefreshToken = sessionRefreshToken ?? localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY)
+  if (storedAuthToken || storedRefreshToken) {
+    syncStoredSession(
+      storedAuthToken,
+      storedRefreshToken,
+      sessionAuthToken || sessionRefreshToken ? 'session' : 'persistent',
+    )
+    if (storedAuthToken && !isBrowserReload()) {
+      restoreCurrentUserFromSession(storedAuthToken)
+    } else {
+      clearCachedAuthState()
+    }
+  }
+}
+
+function shouldSkipSessionRefresh(url?: string): boolean {
+  if (!url) {
+    return false
+  }
+
+  return [
+    '/api/auth/login',
+    '/api/auth/google-token',
+    '/api/auth/apple-token',
+    '/api/auth/register',
+    '/api/auth/refresh',
+    '/api/auth/logout',
+  ].some((path) => url.includes(path))
+}
+
+function canRetryOnFallback(method?: string, url?: string): boolean {
+  const normalizedMethod = method?.toLowerCase() ?? 'get'
+  if (['get', 'head', 'options'].includes(normalizedMethod)) return true
+  if (!url) return false
+  return [
+    '/api/auth/login',
+    '/api/auth/google-token',
+    '/api/auth/apple-token',
+    '/api/auth/register',
+    '/api/auth/refresh',
+  ].some((path) => url.includes(path))
+}
+
+async function postToLoginProvider<T>(path: string, data: unknown): Promise<AxiosResponse<T>> {
+  const candidates = getLoginProviderCandidates()
+  let lastError: unknown = new Error('No login provider is configured.')
+
+  for (const baseURL of candidates) {
+    try {
+      const response = await api.post<T>(path, data, {
+        baseURL,
+        timeout: LOGIN_PROVIDER_TIMEOUT_MS,
+        _loginProviderAttempt: true,
+      } as Parameters<typeof api.post<T>>[2] & { _loginProviderAttempt: boolean })
+      if (
+        typeof response.data !== 'object'
+        || response.data === null
+        || Array.isArray(response.data)
+      ) {
+        lastError = new Error(`Invalid authentication response from ${baseURL}.`)
+        continue
+      }
+      cacheLoginProvider(baseURL)
+      setActiveApiBaseUrl(baseURL)
+      return response
+    } catch (error) {
+      lastError = error
+      if (axios.isAxiosError(error)) {
+        const status = error.response?.status
+        if (status && ![404, 408, 502, 503, 504].includes(status)) {
+          cacheLoginProvider(baseURL)
+          setActiveApiBaseUrl(baseURL)
+          throw error
+        }
+      }
+    }
+  }
+
+  throw lastError
+}
+
+async function selectHealthyBackend(): Promise<boolean> {
+  const healthyBaseUrl = await findHealthyApiBaseUrl()
+  if (!healthyBaseUrl) return false
+  setActiveApiBaseUrl(healthyBaseUrl)
+  return true
+}
+
+// Request interceptor
+api.interceptors.request.use(
+  (config) => {
+    if (isDevelopment) {
+      console.log(`[API] ${config.method?.toUpperCase()} ${config.url}`)
+    }
+    return config
+  },
+  (error) => {
+    if (isDevelopment) {
+      console.error('[API] Request error:', error)
+    }
+    return Promise.reject(error)
+  }
+)
+
+// Response interceptor
+api.interceptors.response.use(
+  (response: AxiosResponse) => {
+    if (isDevelopment) {
+      console.log(`[API] Response: ${response.status} ${response.statusText}`)
+    }
+    return response
+  },
+  async (error: AxiosError) => {
+    if (isDevelopment) {
+      console.error('[API] Response error:', {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        message: error.message,
+      })
+    }
+
+    const originalRequest = error.config as (typeof error.config & {
+      _retry?: boolean
+      _failoverRetry?: boolean
+      _loginProviderAttempt?: boolean
+    }) | undefined
+    const refreshTokenCandidate = getRefreshToken()
+
+    if (
+      !error.response
+      && originalRequest
+      && !originalRequest._loginProviderAttempt
+      && !originalRequest._failoverRetry
+      && apiBaseUrlCandidates.length > 1
+      && canRetryOnFallback(originalRequest.method, originalRequest.url)
+    ) {
+      originalRequest._failoverRetry = true
+      const failedBaseUrl = originalRequest.baseURL ?? activeApiBaseUrl
+      const fallbackCandidates = apiBaseUrlCandidates.filter((candidate) => candidate !== failedBaseUrl)
+      for (const candidate of fallbackCandidates) {
+        try {
+          const response = await healthCheckClient.get('/api/health', { baseURL: candidate })
+          if (response.status !== 200) continue
+          setActiveApiBaseUrl(candidate)
+          originalRequest.baseURL = candidate
+          return await api.request(originalRequest)
+        } catch {
+          // Continue to the next configured fallback.
+        }
+      }
+    }
+
+    if (
+      error.response?.status === 401 &&
+      originalRequest &&
+      !originalRequest._retry &&
+      refreshTokenCandidate &&
+      !shouldSkipSessionRefresh(originalRequest.url)
+    ) {
+      originalRequest._retry = true
+
+      try {
+        const nextAccessToken = await refreshAuthToken()
+        if (originalRequest.headers) {
+          const requestHeaders = originalRequest.headers as Record<string, unknown>
+          requestHeaders.Authorization = `Bearer ${nextAccessToken}`
+        }
+        return await api.request(originalRequest)
+      } catch (refreshError) {
+        syncStoredSession(null, null)
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('auth:session-expired'))
+        }
+        return Promise.reject(refreshError)
+      }
+    }
+
+    return Promise.reject(error)
+  }
+)
+
+export function getErrorMessage(error: unknown, fallback: string): string {
+  if (axios.isAxiosError(error)) {
+    const responseData = error.response?.data
+
+    // Handle server-provided error messages
+    if (
+      responseData &&
+      typeof responseData === 'object' &&
+      'error' in responseData &&
+      typeof responseData.error === 'string'
+    ) {
+      return responseData.error
+    }
+
+    if (
+      responseData &&
+      typeof responseData === 'object' &&
+      'detail' in responseData &&
+      typeof responseData.detail === 'string'
+    ) {
+      return responseData.detail
+    }
+
+    // Handle network errors
+    if (!error.response) {
+      if (error.code === 'ECONNABORTED') {
+        return 'We are securely analyzing your document. This may take up to 60 seconds depending on image quality and server load. Thank you for your patience.'
+      }
+      return `We are unable to connect the verification service at this time. Please try again later. Tried: ${apiBaseUrlCandidates.join(', ')}. If the problem persists, contact support.`
+    }
+
+    // Handle HTTP errors
+    switch (error.response?.status) {
+      case 400:
+        return 'Invalid request. Please check your input.'
+      case 401:
+        return 'Unauthorized. Please log in again.'
+      case 403:
+        return 'You do not have permission to access this resource.'
+      case 404:
+        return 'Resource not found.'
+      case 500:
+        return 'Server error. Please try again later.'
+      case 502:
+      case 503:
+      case 504:
+        return 'Server is temporarily unavailable.'
+      default:
+        return `Error: ${error.response?.statusText || fallback}`
+    }
+  }
+
+  return fallback
+}
+
+/**
+ * Check if the backend is reachable
+ */
+export async function checkBackendHealth(): Promise<boolean> {
+  return selectHealthyBackend()
+}
+
+/**
+ * Get the configured API base URL
+ */
+export function getApiBaseUrl(): string {
+  return activeApiBaseUrl
+}
+
+// Auth API calls
+export interface LoginRequest {
+  username: string
+  password: string
+  rememberMe?: boolean
+}
+
+export interface GoogleLoginRequest {
+  idToken: string
+  platform: 'web' | 'ios' | 'android'
+  rememberMe?: boolean
+  subscriberType?: 'borrower' | 'lender'
+  lenderDataSharingConsent?: boolean
+}
+
+export interface AppleLoginRequest {
+  idToken: string
+  rememberMe?: boolean
+  subscriberType?: 'borrower' | 'lender'
+  lenderDataSharingConsent?: boolean
+}
+
+export interface LoginResponse {
+  token: string
+  refreshToken: string
+  user: AuthUser
+}
+
+export interface AuthUser {
+  id: number
+  username: string
+  email: string
+  role: string
+  roles: string[]
+  permissions: string[]
+  isActive: boolean
+  subscriptionId?: number | null
+  createdAt: string
+  updatedAt: string
+  lastLoginAt: string | null
+  hasAppleSignIn?: boolean
+  hasGoogleSignIn?: boolean
+  mfaEnabled?: boolean
+  lenderDataSharingConsent?: boolean
+  lenderDataSharingConsentRecordedAt?: string | null
+  accessState?: 'TRIAL' | 'TRIAL_REMINDER' | 'GRACE' | 'PAID' | 'LOCKED'
+  trialExpiresAt?: string | null
+  graceExpiresAt?: string | null
+  paymentRequired?: boolean
+}
+
+function normalizeAuthUser(raw: Record<string, unknown>): AuthUser {
+  const rolesFromPayload = Array.isArray(raw.roles)
+    ? raw.roles.filter((role): role is string => typeof role === 'string')
+    : []
+  const roleFromPayload =
+    typeof raw.role === 'string' && raw.role.length > 0
+      ? raw.role
+      : rolesFromPayload[0] ?? 'subscriber'
+
+  const permissions = Array.isArray(raw.permissions)
+    ? raw.permissions.filter((permission): permission is string => typeof permission === 'string')
+    : []
+
+  return {
+    id: Number(raw.id ?? 0),
+    username: String(raw.username ?? ''),
+    email: String(raw.email ?? ''),
+    role: roleFromPayload,
+    roles: rolesFromPayload.length > 0 ? rolesFromPayload : [roleFromPayload],
+    permissions,
+    isActive: Boolean(raw.isActive ?? raw.is_active ?? true),
+    subscriptionId: (raw.subscriptionId ?? raw.subscription_id ?? null) as number | null,
+    createdAt: String(raw.createdAt ?? raw.created_at ?? ''),
+    updatedAt: String(raw.updatedAt ?? raw.updated_at ?? ''),
+    lastLoginAt: (raw.lastLoginAt ?? raw.last_login_at ?? null) as string | null,
+    hasAppleSignIn: Boolean(raw.hasAppleSignIn ?? raw.has_apple_sign_in ?? false),
+    hasGoogleSignIn: Boolean(raw.hasGoogleSignIn ?? raw.has_google_sign_in ?? false),
+    mfaEnabled: Boolean(raw.mfaEnabled ?? raw.mfa_enabled ?? false),
+    lenderDataSharingConsent: Boolean(
+      raw.lenderDataSharingConsent ?? raw.lender_data_sharing_consent ?? false,
+    ),
+    lenderDataSharingConsentRecordedAt: (
+      raw.lenderDataSharingConsentRecordedAt ?? raw.lender_data_sharing_consent_recorded_at ?? null
+    ) as string | null,
+    accessState: (raw.accessState ?? raw.access_state) as AuthUser['accessState'],
+    trialExpiresAt: (raw.trialExpiresAt ?? raw.trial_expires_at ?? null) as string | null,
+    graceExpiresAt: (raw.graceExpiresAt ?? raw.grace_expires_at ?? null) as string | null,
+    paymentRequired: Boolean(raw.paymentRequired ?? raw.payment_required ?? false),
+  }
+}
+
+export interface RegisterRequest {
+  username: string
+  email: string
+  password: string
+  subscriberType: 'borrower' | 'lender'
+  lenderDataSharingConsent: boolean
+  turnstileToken?: string
+}
+
+function extractSessionTokens(responseData: Record<string, unknown>): {
+  accessToken: string | null
+  refreshToken: string | null
+} {
+  return {
+    accessToken:
+      (typeof responseData.token === 'string' ? responseData.token : null) ??
+      (typeof responseData.access_token === 'string' ? responseData.access_token : null),
+    refreshToken:
+      (typeof responseData.refreshToken === 'string' ? responseData.refreshToken : null) ??
+      (typeof responseData.refresh_token === 'string' ? responseData.refresh_token : null),
+  }
+}
+
+function syncSessionFromAuthResponse(
+  responseData: Record<string, unknown>,
+  storageMode: AuthStorageMode = authStorageMode,
+): {
+  accessToken: string
+  refreshToken: string
+} {
+  const tokens = extractSessionTokens(responseData)
+
+  if (!tokens.accessToken || !tokens.refreshToken) {
+    throw new Error('Unexpected authentication tokens received from the backend.')
+  }
+
+  syncStoredSession(tokens.accessToken, tokens.refreshToken, storageMode)
+  return {
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+  }
+}
+
+export async function login(credentials: LoginRequest): Promise<LoginResponse> {
+  const response = await postToLoginProvider<Record<string, unknown>>('/api/auth/login', {
+    username: credentials.username,
+    password: credentials.password,
+  })
+  const responseData = response.data as Record<string, unknown>
+  const user = responseData.user as Record<string, unknown> | undefined
+
+  if (!user) {
+    throw new Error('Unexpected login response received from the backend.')
+  }
+
+  const { accessToken, refreshToken } = syncSessionFromAuthResponse(
+    responseData,
+    credentials.rememberMe ? 'persistent' : 'session',
+  )
+  const currentUser = storeCurrentUser(normalizeAuthUser(user))
+  currentUserRequest = null
+  return {
+    token: accessToken,
+    refreshToken,
+    user: currentUser,
+  }
+}
+
+export async function loginWithGoogle(payload: GoogleLoginRequest): Promise<LoginResponse> {
+  const response = await postToLoginProvider<Record<string, unknown>>('/api/auth/google-token', {
+    id_token: payload.idToken,
+    platform: payload.platform,
+    subscriber_type: payload.subscriberType,
+    lender_data_sharing_consent: payload.lenderDataSharingConsent,
+  })
+  const responseData = response.data as Record<string, unknown>
+  const user = responseData.user as Record<string, unknown> | undefined
+
+  if (!user) {
+    throw new Error('Unexpected Google login response received from the backend.')
+  }
+
+  const { accessToken, refreshToken } = syncSessionFromAuthResponse(
+    responseData,
+    payload.rememberMe ? 'persistent' : 'session',
+  )
+  const currentUser = storeCurrentUser(normalizeAuthUser(user))
+  currentUserRequest = null
+
+  return {
+    token: accessToken,
+    refreshToken,
+    user: currentUser,
+  }
+}
+
+export async function loginWithApple(payload: AppleLoginRequest): Promise<LoginResponse> {
+  const response = await postToLoginProvider<Record<string, unknown>>('/api/auth/apple-token', {
+    identity_token: payload.idToken,
+    id_token: payload.idToken,
+    subscriber_type: payload.subscriberType,
+    lender_data_sharing_consent: payload.lenderDataSharingConsent,
+  })
+  const responseData = response.data as Record<string, unknown>
+  const user = responseData.user as Record<string, unknown> | undefined
+
+  if (!user) {
+    throw new Error('Unexpected Apple login response received from the backend.')
+  }
+
+  const { accessToken, refreshToken } = syncSessionFromAuthResponse(
+    responseData,
+    payload.rememberMe ? 'persistent' : 'session',
+  )
+  const currentUser = storeCurrentUser(normalizeAuthUser(user))
+  currentUserRequest = null
+
+  return {
+    token: accessToken,
+    refreshToken,
+    user: currentUser,
+  }
+}
+
+export async function register(data: RegisterRequest): Promise<LoginResponse> {
+  const response = await api.post('/api/auth/register', {
+    username: data.username,
+    email: data.email,
+    password: data.password,
+    subscriber_type: data.subscriberType,
+    lender_data_sharing_consent: data.lenderDataSharingConsent,
+    turnstile_token: data.turnstileToken,
+  }, {
+    timeout: AUTH_REQUEST_TIMEOUT_MS,
+  })
+  const responseData = response.data as Record<string, unknown>
+  const rawUser = responseData.user as Record<string, unknown> | undefined
+  if (!rawUser) {
+    throw new Error('Unexpected registration response received from the backend.')
+  }
+
+  const { accessToken, refreshToken } = syncSessionFromAuthResponse(responseData)
+  const currentUser = storeCurrentUser(normalizeAuthUser(rawUser))
+  currentUserRequest = null
+  return { token: accessToken, refreshToken, user: currentUser }
+}
+
+export async function logout(): Promise<void> {
+  const currentRefreshToken = getRefreshToken()
+  const autosaveOwnerToken = getAuthToken() ?? currentRefreshToken
+
+  clearAutosaveDraftsForToken(autosaveOwnerToken)
+  syncStoredSession(null, null)
+
+  if (currentRefreshToken) {
+    void api.post('/api/auth/logout', {
+      refresh_token: currentRefreshToken,
+    }, {
+      timeout: LOGOUT_REVOCATION_TIMEOUT_MS,
+    }).catch(() => {
+      // Remote revocation is best-effort after the local session is closed.
+    })
+  }
+}
+
+export async function refreshAuthToken(): Promise<string> {
+  if (refreshTokenRequest) {
+    return refreshTokenRequest
+  }
+
+  const currentRefreshToken = getRefreshToken()
+  if (!currentRefreshToken) {
+    syncStoredSession(null, null)
+    throw new Error('Unable to refresh the session because no refresh token is available.')
+  }
+
+  refreshTokenRequest = api
+    .post<Record<string, unknown>>('/api/auth/refresh', {
+      refresh_token: currentRefreshToken,
+    })
+    .then((response) => {
+      const { accessToken } = syncSessionFromAuthResponse(response.data)
+      return accessToken
+    })
+    .finally(() => {
+      refreshTokenRequest = null
+    })
+
+  return refreshTokenRequest
+}
+
+export async function fetchCurrentUser(): Promise<LoginResponse['user']> {
+  if (currentUserCache) {
+    return currentUserCache
+  }
+
+  if (currentUserRequest) {
+    return currentUserRequest
+  }
+
+  currentUserRequest = api
+    .get<{
+      user: Record<string, unknown>
+    }>('/api/auth/me')
+    .then((response) => {
+      return storeCurrentUser(normalizeAuthUser(response.data.user))
+    })
+    .finally(() => {
+      currentUserRequest = null
+    })
+
+  return currentUserRequest
+}
+
+export async function updateAccountPreferences(payload: {
+  lenderDataSharingConsent: boolean
+}): Promise<{ message: string; user: LoginResponse['user'] }> {
+  const response = await api.patch<{
+    message: string
+    user: Record<string, unknown>
+  }>('/api/auth/preferences', {
+    lender_data_sharing_consent: payload.lenderDataSharingConsent,
+  })
+
+  const normalizedUser = normalizeAuthUser(response.data.user)
+  storeCurrentUser(normalizedUser)
+
+  return {
+    message: response.data.message,
+    user: normalizedUser,
+  }
+}
+
+export async function disconnectSignInProvider(
+  provider: 'apple' | 'google',
+): Promise<{ message: string; signOutRequired: boolean }> {
+  const response = await api.delete<{
+    message: string
+    sign_out_required: boolean
+  }>(`/api/auth/providers/${provider}`)
+
+  return {
+    message: response.data.message,
+    signOutRequired: response.data.sign_out_required,
+  }
+}
+
+export interface AdminPermission {
+  id: number
+  name: string
+  description: string | null
+  resource: string
+  action: string
+}
+
+export interface AdminRole {
+  id: number
+  name: string
+  description: string | null
+  is_system?: boolean
+  permissions: AdminPermission[]
+}
+
+export interface AdminUser {
+  id: number
+  username: string
+  email: string
+  is_active: boolean
+  is_deleted?: boolean
+  account_status?: 'ACTIVE' | 'PENDING' | 'LOCKED' | 'SUSPENDED' | 'DISABLED' | 'DELETED'
+  first_name?: string | null
+  middle_name?: string | null
+  last_name?: string | null
+  mobile_no?: string | null
+  role_id?: number | null
+  subscription_id?: number | null
+  api_access?: boolean
+  email_verified?: boolean
+  admin_user_notification_sent_at?: string | null
+  last_login_ip?: string | null
+  last_login_device?: string | null
+  total_login_count?: number
+  mfa_enabled?: boolean
+  last_login_at?: string | null
+  roles: string[]
+  permissions: string[]
+  created_at?: string
+}
+
+export async function listAdminUsers(): Promise<AdminUser[]> {
+  const response = await api.get<{ users: AdminUser[] }>('/api/admin/users')
+  return response.data.users
+}
+
+export async function createAdminUser(payload: {
+  username: string
+  email: string
+  password: string
+  is_active?: boolean
+  account_status?: 'ACTIVE' | 'PENDING' | 'LOCKED' | 'SUSPENDED' | 'DISABLED' | 'DELETED'
+  first_name?: string
+  middle_name?: string
+  last_name?: string
+  mobile_no?: string
+  role_id?: number
+  subscription_id?: number
+  api_access?: boolean
+  email_verified?: boolean
+  roles?: string[]
+}): Promise<AdminUser> {
+  const response = await api.post<{ user: AdminUser }>('/api/admin/users', payload)
+  return response.data.user
+}
+
+export async function updateAdminUser(
+  userId: number,
+  payload: {
+    email?: string
+    is_active?: boolean
+    account_status?: 'ACTIVE' | 'PENDING' | 'LOCKED' | 'SUSPENDED' | 'DISABLED' | 'DELETED'
+    first_name?: string
+    middle_name?: string
+    last_name?: string
+    mobile_no?: string
+    role_id?: number
+    subscription_id?: number | null
+    api_access?: boolean
+    email_verified?: boolean
+  },
+): Promise<AdminUser> {
+  const response = await api.patch<{ user: AdminUser }>(`/api/admin/users/${userId}`, payload)
+  return response.data.user
+}
+
+export async function assignAdminUserRoles(userId: number, roles: string[]): Promise<AdminUser> {
+  const response = await api.put<{ user: AdminUser }>(`/api/admin/users/${userId}/roles`, {
+    roles,
+  })
+  return response.data.user
+}
+
+export async function listAdminRoles(): Promise<AdminRole[]> {
+  const response = await api.get<{ roles: AdminRole[] }>('/api/admin/roles')
+  return response.data.roles
+}
+
+export async function createAdminRole(payload: {
+  name: string
+  description?: string
+}): Promise<AdminRole> {
+  const response = await api.post<{ role: AdminRole }>('/api/admin/roles', payload)
+  return response.data.role
+}
+
+export async function assignRolePermissions(roleId: number, permissions: string[]): Promise<void> {
+  await api.put(`/api/admin/roles/${roleId}/permissions`, { permissions })
+}
+
+export async function listAdminPermissions(): Promise<AdminPermission[]> {
+  const response = await api.get<{ permissions: AdminPermission[] }>('/api/admin/permissions')
+  return response.data.permissions
+}
+
+export async function createAdminPermission(payload: {
+  name: string
+  description?: string
+  resource: string
+  action: string
+}): Promise<AdminPermission> {
+  const response = await api.post<{ permission: AdminPermission }>('/api/admin/permissions', payload)
+  return response.data.permission
+}
+
+export async function requestPasswordReset(emailOrUsername: string, turnstileToken?: string): Promise<{
+  message: string
+  reset_token?: string
+  user_id?: number
+}> {
+  const response = await api.post<{
+    message: string
+    reset_token?: string
+    user_id?: number
+  }>('/api/auth/password-reset-request', {
+    email_or_username: emailOrUsername,
+    turnstile_token: turnstileToken,
+  })
+  return response.data
+}
+
+export async function confirmPasswordReset(
+  userId: number,
+  resetToken: string,
+  newPassword: string,
+): Promise<{ message: string }> {
+  const response = await api.post<{ message: string }>(
+    '/api/auth/password-reset-confirm',
+    {
+      user_id: userId,
+      reset_token: resetToken,
+      new_password: newPassword,
+    },
+  )
+  return response.data
+}
+
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<{ message: string }> {
+  const response = await api.post<{ message: string }>('/api/auth/password/change', {
+    current_password: currentPassword,
+    new_password: newPassword,
+  })
+  return response.data
+}
+
+export async function deleteAccount(payload: {
+  currentPassword?: string
+  deletionMode?: 'account_and_data' | 'data_only'
+}): Promise<{ message: string }> {
+  const response = await api.post<{ message: string }>('/api/auth/delete-account', {
+    current_password: payload.currentPassword,
+    deletion_mode: payload.deletionMode ?? 'account_and_data',
+  })
+  return response.data
+}
+
+export interface MeetingRecord {
+  id: number
+  meeting_title: string
+  meeting_date: string | null
+  created_at: string | null
+}
+
+export interface MeetingDetailsRecord extends MeetingRecord {
+  transcript: string
+  summary: string
+  action_items: string
+}
+
+export interface MeetingTranscriptResponse {
+  transcript: string
+}
+
+export interface MeetingMinutesResponse {
+  id?: number
+  summary?: string
+  message?: string
+}
+
+export async function transcribeMeetingAudio(
+  audioFile: File,
+  consentVersion: string,
+): Promise<MeetingTranscriptResponse> {
+  const formData = new FormData()
+  formData.append('audio', audioFile)
+  formData.append('ai_processing_consent', 'true')
+  formData.append('consent_version', consentVersion)
+
+  const response = await api.post<MeetingTranscriptResponse>('/ai/transcribe', formData, {
+    headers: {
+      'Content-Type': 'multipart/form-data',
+    },
+  })
+  return response.data
+}
+
+export async function generateMeetingMinutes(payload: {
+  meetingTitle: string
+  meetingDate: string
+  transcript: string
+  consentVersion: string
+}): Promise<MeetingMinutesResponse> {
+  const response = await api.post<MeetingMinutesResponse>('/ai/minutes', {
+    meeting_title: payload.meetingTitle,
+    meeting_date: payload.meetingDate,
+    transcript: payload.transcript,
+    ai_processing_consent: true,
+    consent_version: payload.consentVersion,
+  })
+  return response.data
+}
+
+export async function listMeetings(): Promise<MeetingRecord[]> {
+  const response = await api.get<MeetingRecord[]>('/ai/meetings')
+  return response.data
+}
+
+export async function searchMeetingsByTitle(search: string): Promise<MeetingRecord[]> {
+  const response = await api.get<MeetingRecord[]>(`/ai/meetings/search/${encodeURIComponent(search)}`)
+  return response.data
+}
+
+export async function fetchMeetingDetails(meetingId: string): Promise<MeetingDetailsRecord> {
+  const response = await api.get<MeetingDetailsRecord>(`/ai/meetings/${meetingId}`)
+  return response.data
+}
+
+export async function downloadMeetingPdf(meetingId: string): Promise<string> {
+  const response = await api.get<Blob>(`/ai/meetings/${meetingId}/pdf`, {
+    responseType: 'blob',
+  })
+  return URL.createObjectURL(response.data)
+}
+
+export interface CreditAdvisorRequestPayload {
+  productType?: string
+  monthlyIncome?: number
+  debtObligations?: number
+  loanAmount?: number
+  appraisedValue?: number
+  dti?: number
+  dsr?: number
+  ltv?: number
+  finalScore?: number
+  finalDecision?: string
+  borrowerNotes?: string
+}
+
+export interface CreditAdvisorResult {
+  provider: string
+  model: string
+  advice: string
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  latency_ms: number
+}
+
+export async function generateCreditAdvisorPlan(
+  payload: CreditAdvisorRequestPayload,
+): Promise<CreditAdvisorResult> {
+  const response = await api.post<CreditAdvisorResult>('/ai/credit-advisor', {
+    product_type: payload.productType,
+    monthly_income: payload.monthlyIncome,
+    debt_obligations: payload.debtObligations,
+    loan_amount: payload.loanAmount,
+    appraised_value: payload.appraisedValue,
+    dti: payload.dti,
+    dsr: payload.dsr,
+    ltv: payload.ltv,
+    final_score: payload.finalScore,
+    final_decision: payload.finalDecision,
+    borrower_notes: payload.borrowerNotes,
+  })
+  return response.data
+}
+
+export interface CreditCardRiskCheckPayload {
+  cardIssuer: string
+  cardNumberBin: string
+  cardNumberLast4: string
+  cardNumberLength: number
+  luhnValid: boolean
+  issuerFromNumber?: string | null
+  issuerMatchesPrefix?: boolean | null
+}
+
+export interface CreditCardRiskCheckResult {
+  provider: string
+  model: string
+  risk_level: 'LOW' | 'MEDIUM' | 'HIGH' | 'UNKNOWN'
+  summary: string
+  recommended_action: string
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  latency_ms: number
+}
+
+export async function checkCreditCardRiskWithAi(
+  payload: CreditCardRiskCheckPayload,
+): Promise<CreditCardRiskCheckResult> {
+  const response = await api.post<CreditCardRiskCheckResult>('/ai/credit-card-risk-check', {
+    card_issuer: payload.cardIssuer,
+    card_number_bin: payload.cardNumberBin,
+    card_number_last4: payload.cardNumberLast4,
+    card_number_length: payload.cardNumberLength,
+    luhn_valid: payload.luhnValid,
+    issuer_from_number: payload.issuerFromNumber ?? null,
+    issuer_matches_prefix: payload.issuerMatchesPrefix ?? null,
+  })
+
+  return response.data
+}
+
+export interface PageAssistantHistoryItem {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface PageAssistantResponse {
+  answer: string
+  refused: boolean
+  disclaimer: string
+}
+
+export function isOpenAiQuotaExhaustionResponse(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object' || !('detail' in payload)) {
+    return false
+  }
+
+  const detail = (payload as { detail?: unknown }).detail
+  return Boolean(
+    detail
+    && typeof detail === 'object'
+    && 'code' in detail
+    && (detail as { code?: unknown }).code === 'openai_quota_exhausted',
+  )
+}
+
+export async function askPageAssistant(payload: {
+  message: string
+  pagePath: string
+  history: PageAssistantHistoryItem[]
+  authenticated: boolean
+}): Promise<PageAssistantResponse> {
+  const endpoint = payload.authenticated
+    ? '/ai/page-assistant'
+    : '/ai/page-assistant/public'
+  const requestBody = {
+    message: payload.message,
+    page_path: payload.pagePath,
+    history: payload.history.slice(-6),
+  }
+
+  try {
+    const response = await api.post<PageAssistantResponse>(endpoint, requestBody)
+    return response.data
+  } catch (error) {
+    const shouldUseLocalFallback = (
+      axios.isAxiosError(error)
+      && isOpenAiQuotaExhaustionResponse(error.response?.data)
+    )
+    if (!shouldUseLocalFallback) {
+      throw error
+    }
+
+    const fallbackResponse = await healthCheckClient.post<PageAssistantResponse>(
+      APP_CONFIG.ollamaFallbackUrl,
+      requestBody,
+      { timeout: 120000 },
+    )
+    return fallbackResponse.data
+  }
+}
+
+export interface SubscriptionPlan {
+  id: number
+  plan_code: string
+  plan_name: string
+  description: string | null
+  billing_cycle: 'MONTHLY' | 'QUARTERLY' | 'YEARLY'
+  monthly_price: number | null
+  yearly_price: number | null
+  minimum_monthly_fee: number | null
+  per_record_fee: number | null
+  currency: string
+  max_users: number | null
+  max_vehicles: number | null
+  max_drivers: number | null
+  max_storage_gb: number | null
+  trial_days: number
+  display_order: number
+  is_public: boolean
+  is_custom_pricing: boolean
+  max_ai_requests_per_month: number
+  max_api_calls_per_month: number
+  max_documents: number
+  max_reports: number
+  max_meetings: number
+  max_storage_files: number
+  storage_unit: string
+  support_level: 'STANDARD' | 'PRIORITY' | 'PREMIUM' | 'ENTERPRISE'
+  sla_hours: number
+  color_code: string | null
+  icon_name: string | null
+  ai_enabled: boolean
+  api_enabled: boolean
+  reporting_enabled: boolean
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface SubscriptionRecord {
+  id: number
+  subscription_no: string
+  user_id: number
+  plan_id: number
+  status: 'PENDING' | 'TRIAL' | 'ACTIVE' | 'SUSPENDED' | 'EXPIRED' | 'CANCELLED'
+  subscription_type: 'FREE' | 'TRIAL' | 'PAID' | 'LIFETIME'
+  trial_start: string | null
+  trial_end: string | null
+  subscription_start: string
+  subscription_end: string | null
+  auto_renew: boolean
+  payment_provider_id: number | null
+  next_billing_date: string | null
+  cancellation_reason: string | null
+  cancelled_at: string | null
+  cancelled_by: number | null
+  grace_period_end: string | null
+  renewal_count: number
+  last_payment_date: string | null
+  next_invoice_date: string | null
+  current_users: number
+  current_vehicles: number
+  current_drivers: number
+  current_storage_gb: number | null
+  current_ai_requests: number
+  current_api_calls: number
+  tenant_id: number | null
+  created_by: number | null
+  updated_by: number | null
+  deleted_by: number | null
+  deleted_at: string | null
+  is_deleted: boolean
+  remarks: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface PaymentProvider {
+  id: number
+  provider_code: string
+  provider_name: string
+  api_endpoint: string | null
+  webhook_url: string | null
+  is_active: boolean
+  created_at: string
+}
+
+export interface SubscriptionPayment {
+  id: number
+  payment_reference: string
+  subscription_id: number | null
+  provider_id: number | null
+  invoice_no: string | null
+  amount: number | null
+  currency: string | null
+  payment_method: string | null
+  payment_status: 'PENDING' | 'SUCCESS' | 'FAILED' | 'REFUNDED'
+  provider_transaction_id: string | null
+  paid_at: string | null
+  created_at: string
+}
+
+export interface PayMongoCheckoutSession {
+  checkout_id: string
+  checkout_url: string
+  amount: number
+  currency: string
+  payment: SubscriptionPayment
+}
+
+export interface PayPalOrderSession {
+  order_id: string
+  status: string
+  approval_url: string | null
+  amount: number
+  currency: string
+  payment: SubscriptionPayment
+  reused?: boolean
+}
+
+export interface PayPalCaptureResult {
+  captured: boolean
+  already_processed?: boolean
+  order_id?: string
+  capture_id?: string | null
+  payment: SubscriptionPayment
+}
+
+export interface RecurringBillingSession {
+  agreement_id: string
+  status: string
+  approval_url: string | null
+  payment_intent_id?: string | null
+  invoice_id?: string | null
+  first_charge_at: string
+  subscription: SubscriptionRecord
+  reused?: boolean
+}
+
+export type NativeStorePlatform = 'ANDROID' | 'IOS'
+export type StoreProductType = 'SUBS' | 'INAPP'
+export type StoreEntitlementCategory = 'REPORTS' | 'STATEMENTS' | 'CERTIFICATIONS' | 'SCORES'
+
+export interface StoreProductMapping {
+  id: number
+  plan_id: number | null
+  platform: NativeStorePlatform
+  product_id: string
+  base_plan_id: string | null
+  product_type: StoreProductType
+  entitlement_category: StoreEntitlementCategory | null
+  is_active: boolean
+}
+
+export interface StoreEntitlements {
+  subscription_grants_all: boolean
+  reports: boolean
+  statements: boolean
+  certifications: boolean
+  scores: boolean
+}
+
+export interface VerifiedStorePurchase {
+  id: number
+  subscription_id: number | null
+  platform: NativeStorePlatform
+  product_id: string
+  transaction_id: string
+  original_transaction_id: string | null
+  status: 'ACTIVE' | 'PENDING' | 'GRACE_PERIOD' | 'EXPIRED' | 'CANCELLED' | 'REVOKED' | 'REFUNDED'
+  purchased_at: string | null
+  expires_at: string | null
+  verified_at: string
+  payment: SubscriptionPayment | null
+}
+
+export interface SubscriptionInvoice {
+  id: number
+  invoice_no: string
+  subscription_id: number
+  invoice_date: string | null
+  due_date: string | null
+  subtotal: number | null
+  tax: number | null
+  total: number | null
+  status: string | null
+  pdf_url: string | null
+  created_at: string
+}
+
+export interface SubscriptionUsage {
+  id: number
+  subscription_id: number
+  usage_date: string | null
+  users_used: number | null
+  vehicles_used: number | null
+  drivers_used: number | null
+  storage_used_gb: number | null
+  api_calls: number | null
+  ai_requests: number | null
+  created_at: string
+}
+
+export interface SubscriptionEvent {
+  id: number
+  subscription_id: number
+  event_type: string
+  event_details: Record<string, unknown>
+  created_by: number
+  created_at: string
+}
+
+export interface PaymentWebhook {
+  id: number
+  provider_id: number
+  event_type: string
+  payload: Record<string, unknown>
+  processed: boolean
+  processed_at: string | null
+  created_at: string
+}
+
+export interface Feature {
+  id: number
+  feature_code: string
+  feature_name: string
+  description: string | null
+}
+
+export async function listSubscriptionPlans(): Promise<SubscriptionPlan[]> {
+  const response = await api.get<SubscriptionPlan[]>('/api/subscriptions/plans')
+  return response.data
+}
+
+export async function listPublicSubscriptionPlans(): Promise<SubscriptionPlan[]> {
+  const response = await api.get<SubscriptionPlan[]>('/api/subscriptions/public-plans')
+  return response.data
+}
+
+export async function createSubscriptionPlan(payload: {
+  plan_code: string
+  plan_name: string
+  description?: string
+  billing_cycle: 'MONTHLY' | 'QUARTERLY' | 'YEARLY'
+  monthly_price?: number
+  yearly_price?: number
+  currency?: string
+  max_users?: number
+  max_vehicles?: number
+  max_drivers?: number
+  max_storage_gb?: number
+  trial_days?: number
+  display_order?: number
+  is_public?: boolean
+  is_custom_pricing?: boolean
+  max_ai_requests_per_month?: number
+  max_api_calls_per_month?: number
+  max_documents?: number
+  max_reports?: number
+  max_meetings?: number
+  max_storage_files?: number
+  storage_unit?: string
+  support_level?: 'STANDARD' | 'PRIORITY' | 'PREMIUM' | 'ENTERPRISE'
+  sla_hours?: number
+  color_code?: string
+  icon_name?: string
+  ai_enabled?: boolean
+  api_enabled?: boolean
+  reporting_enabled?: boolean
+  is_active?: boolean
+}): Promise<SubscriptionPlan> {
+  const response = await api.post<SubscriptionPlan>('/api/subscriptions/plans', payload)
+  return response.data
+}
+
+export async function updateSubscriptionPlan(
+  planId: number,
+  payload: {
+    plan_code?: string
+    plan_name?: string
+    description?: string
+    billing_cycle?: 'MONTHLY' | 'QUARTERLY' | 'YEARLY'
+    monthly_price?: number
+    yearly_price?: number
+    currency?: string
+    max_users?: number
+    max_vehicles?: number
+    max_drivers?: number
+    max_storage_gb?: number
+    trial_days?: number
+    display_order?: number
+    is_public?: boolean
+    is_custom_pricing?: boolean
+    max_ai_requests_per_month?: number
+    max_api_calls_per_month?: number
+    max_documents?: number
+    max_reports?: number
+    max_meetings?: number
+    max_storage_files?: number
+    storage_unit?: string
+    support_level?: 'STANDARD' | 'PRIORITY' | 'PREMIUM' | 'ENTERPRISE'
+    sla_hours?: number
+    color_code?: string
+    icon_name?: string
+    ai_enabled?: boolean
+    api_enabled?: boolean
+    reporting_enabled?: boolean
+    is_active?: boolean
+  },
+): Promise<SubscriptionPlan> {
+  const response = await api.patch<SubscriptionPlan>(`/api/subscriptions/plans/${planId}`, payload)
+  return response.data
+}
+
+export async function listSubscriptions(status?: string): Promise<SubscriptionRecord[]> {
+  const response = await api.get<SubscriptionRecord[]>('/api/subscriptions', {
+    params: status ? { status } : undefined,
+  })
+  return response.data
+}
+
+export async function getMySubscription(): Promise<SubscriptionRecord | null> {
+  const response = await api.get<SubscriptionRecord | null>('/api/subscriptions/me')
+  return response.data
+}
+
+export async function createFreeSubscription(payload?: { user_id?: number }): Promise<SubscriptionRecord> {
+  const response = await api.post<SubscriptionRecord>('/api/subscriptions/create-free', payload ?? {})
+  return response.data
+}
+
+export async function createSubscription(payload: {
+  subscription_no: string
+  user_id?: number
+  plan_id: number
+  status: 'PENDING' | 'TRIAL' | 'ACTIVE' | 'SUSPENDED' | 'EXPIRED' | 'CANCELLED'
+  subscription_type?: 'FREE' | 'TRIAL' | 'PAID' | 'LIFETIME'
+  trial_start?: string
+  trial_end?: string
+  subscription_start: string
+  subscription_end?: string
+  auto_renew?: boolean
+  payment_provider_id?: number
+  next_billing_date?: string
+  cancellation_reason?: string
+  cancelled_at?: string
+  cancelled_by?: number
+  grace_period_end?: string
+  renewal_count?: number
+  last_payment_date?: string
+  next_invoice_date?: string
+  current_users?: number
+  current_vehicles?: number
+  current_drivers?: number
+  current_storage_gb?: number
+  current_ai_requests?: number
+  current_api_calls?: number
+  tenant_id?: number
+  created_by?: number
+  updated_by?: number
+  deleted_by?: number
+  deleted_at?: string
+  is_deleted?: boolean
+  remarks?: string
+}): Promise<SubscriptionRecord> {
+  const response = await api.post<SubscriptionRecord>('/api/subscriptions', payload)
+  return response.data
+}
+
+export async function updateSubscription(
+  subscriptionId: number,
+  payload: {
+    user_id?: number
+    plan_id?: number
+    status?: 'PENDING' | 'TRIAL' | 'ACTIVE' | 'SUSPENDED' | 'EXPIRED' | 'CANCELLED'
+    subscription_type?: 'FREE' | 'TRIAL' | 'PAID' | 'LIFETIME'
+    trial_start?: string
+    trial_end?: string
+    subscription_start?: string
+    subscription_end?: string
+    auto_renew?: boolean
+    payment_provider_id?: number
+    next_billing_date?: string
+    cancellation_reason?: string
+    cancelled_at?: string
+    cancelled_by?: number
+    grace_period_end?: string
+    renewal_count?: number
+    last_payment_date?: string
+    next_invoice_date?: string
+    current_users?: number
+    current_vehicles?: number
+    current_drivers?: number
+    current_storage_gb?: number
+    current_ai_requests?: number
+    current_api_calls?: number
+    tenant_id?: number
+    created_by?: number
+    updated_by?: number
+    deleted_by?: number
+    deleted_at?: string
+    is_deleted?: boolean
+    remarks?: string
+  },
+): Promise<SubscriptionRecord> {
+  const response = await api.patch<SubscriptionRecord>(`/api/subscriptions/${subscriptionId}`, payload)
+  return response.data
+}
+
+export async function updateSubscriptionStatus(
+  subscriptionId: number,
+  status: 'PENDING' | 'TRIAL' | 'ACTIVE' | 'SUSPENDED' | 'EXPIRED' | 'CANCELLED',
+): Promise<SubscriptionRecord> {
+  const response = await api.patch<SubscriptionRecord>(`/api/subscriptions/${subscriptionId}/status`, null, {
+    params: { status },
+  })
+  return response.data
+}
+
+export async function createSubscriptionCheckout(payload: {
+  plan: string
+  billing_cycle: 'MONTHLY' | 'QUARTERLY' | 'YEARLY'
+}): Promise<{ checkout_url: string }> {
+  const response = await api.post<{ checkout_url: string }>('/api/subscriptions/create-checkout', payload)
+  return response.data
+}
+
+export async function listStoreProducts(platform: NativeStorePlatform): Promise<StoreProductMapping[]> {
+  const response = await api.get<StoreProductMapping[]>('/api/subscriptions/store-products', {
+    params: { platform },
+  })
+  return response.data
+}
+
+export async function getMyStoreEntitlements(): Promise<StoreEntitlements> {
+  const response = await api.get<StoreEntitlements>('/api/subscriptions/me/store-entitlements')
+  return response.data
+}
+
+export async function verifyNativeStorePurchase(payload: {
+  platform: NativeStorePlatform
+  product_id: string
+  verification_data: string
+  subscription_id?: number
+}): Promise<VerifiedStorePurchase> {
+  const response = await api.post<VerifiedStorePurchase>('/api/subscriptions/store-purchases/verify', payload)
+  return response.data
+}
+
+export async function listPaymentProviders(): Promise<PaymentProvider[]> {
+  const response = await api.get<PaymentProvider[]>('/api/subscriptions/providers')
+  return response.data
+}
+
+export async function createPaymentProvider(payload: {
+  provider_code: string
+  provider_name: string
+  api_endpoint?: string
+  webhook_url?: string
+  is_active?: boolean
+}): Promise<PaymentProvider> {
+  const response = await api.post<PaymentProvider>('/api/subscriptions/providers', payload)
+  return response.data
+}
+
+export async function listSubscriptionPayments(): Promise<SubscriptionPayment[]> {
+  const response = await api.get<SubscriptionPayment[]>('/api/subscriptions/payments')
+  return response.data
+}
+
+export async function createSubscriptionPayment(payload: {
+  payment_reference: string
+  subscription_id: number
+  provider_id?: number
+  invoice_no?: string
+  amount?: number
+  currency?: string
+  payment_method?: string
+  payment_status: 'PENDING' | 'SUCCESS' | 'FAILED' | 'REFUNDED'
+  provider_transaction_id?: string
+  paid_at?: string
+}): Promise<SubscriptionPayment> {
+  const response = await api.post<SubscriptionPayment>('/api/subscriptions/payments', payload)
+  return response.data
+}
+
+export async function createPayMongoCheckout(payload: {
+  subscription_id: number
+  invoice_no?: string
+}): Promise<PayMongoCheckoutSession> {
+  const response = await api.post<PayMongoCheckoutSession>(
+    '/api/subscriptions/payments/paymongo/checkout',
+    payload,
+  )
+  return response.data
+}
+
+export async function cancelSubscriptionPayment(payload: {
+  provider_code: 'PAYMONGO' | 'PAYPAL'
+  provider_transaction_id: string
+}): Promise<SubscriptionPayment> {
+  const response = await api.post<SubscriptionPayment>('/api/subscriptions/payments/cancel', payload)
+  return response.data
+}
+
+export async function cancelPublicTrialPayment(payload: {
+  account_identifier: string
+  plan: 'single' | 'multiple'
+  provider_code: 'PAYMONGO' | 'PAYPAL'
+  provider_transaction_id: string
+}): Promise<SubscriptionPayment> {
+  const response = await api.post<SubscriptionPayment>('/api/subscriptions/public/payments/cancel', payload)
+  return response.data
+}
+
+export async function createPayMongoSubscription(payload: {
+  subscription_id: number
+  request_id: string
+  payment_method_id: string
+}): Promise<RecurringBillingSession> {
+  const response = await api.post<RecurringBillingSession>(
+    '/api/subscriptions/payments/paymongo/subscription',
+    payload,
+  )
+  return response.data
+}
+
+export async function createPublicTrialPayMongoCheckout(payload: {
+  account_identifier: string
+  plan: 'single' | 'multiple'
+}): Promise<PayMongoCheckoutSession> {
+  const response = await api.post<PayMongoCheckoutSession>(
+    '/api/subscriptions/public/payments/paymongo/checkout',
+    payload,
+  )
+  return response.data
+}
+
+export async function createPayPalOrder(payload: {
+  subscription_id: number
+  invoice_no?: string
+  request_id?: string
+}): Promise<PayPalOrderSession> {
+  const response = await api.post<PayPalOrderSession>('/api/paypal/create-order', payload)
+  return response.data
+}
+
+export async function createPayPalSubscription(payload: {
+  subscription_id: number
+  request_id: string
+}): Promise<RecurringBillingSession> {
+  const response = await api.post<RecurringBillingSession>('/api/paypal/create-subscription', payload)
+  return response.data
+}
+
+export async function cancelRecurringSubscription(
+  subscriptionId: number,
+  payload: {
+    cancellation_reason: 'too_expensive' | 'missing_features' | 'switched_service' | 'unused' | 'other'
+    reason_details?: string
+  },
+): Promise<void> {
+  await api.post(`/api/subscriptions/${subscriptionId}/recurring/cancel`, payload)
+}
+
+export async function createPublicTrialPayPalOrder(payload: {
+  account_identifier: string
+  plan: 'single' | 'multiple'
+  request_id?: string
+}): Promise<PayPalOrderSession> {
+  const response = await api.post<PayPalOrderSession>(
+    '/api/subscriptions/public/payments/paypal/create-order',
+    payload,
+  )
+  return response.data
+}
+
+export async function capturePayPalOrder(payload: {
+  order_id: string
+  subscription_id?: number
+}): Promise<PayPalCaptureResult> {
+  const response = await api.post<PayPalCaptureResult>('/api/paypal/capture-order', payload)
+  return response.data
+}
+
+export async function capturePublicTrialPayPalOrder(payload: {
+  account_identifier: string
+  plan: 'single' | 'multiple'
+  order_id: string
+}): Promise<PayPalCaptureResult> {
+  const response = await api.post<PayPalCaptureResult>(
+    '/api/subscriptions/public/payments/paypal/capture-order',
+    payload,
+  )
+  return response.data
+}
+
+export async function updateSubscriptionPayment(
+  paymentId: number,
+  payload: {
+    provider_id?: number
+    invoice_no?: string
+    amount?: number
+    currency?: string
+    payment_method?: string
+    payment_status?: 'PENDING' | 'SUCCESS' | 'FAILED' | 'REFUNDED'
+    provider_transaction_id?: string
+    paid_at?: string
+  },
+): Promise<SubscriptionPayment> {
+  const response = await api.patch<SubscriptionPayment>(`/api/subscriptions/payments/${paymentId}`, payload)
+  return response.data
+}
+
+export async function listSubscriptionInvoices(): Promise<SubscriptionInvoice[]> {
+  const response = await api.get<SubscriptionInvoice[]>('/api/subscriptions/invoices')
+  return response.data
+}
+
+export async function createSubscriptionInvoice(payload: {
+  invoice_no: string
+  subscription_id: number
+  invoice_date?: string
+  due_date?: string
+  subtotal?: number
+  tax?: number
+  total?: number
+  status?: string
+  pdf_url?: string
+}): Promise<SubscriptionInvoice> {
+  const response = await api.post<SubscriptionInvoice>('/api/subscriptions/invoices', payload)
+  return response.data
+}
+
+export async function listSubscriptionUsage(): Promise<SubscriptionUsage[]> {
+  const response = await api.get<SubscriptionUsage[]>('/api/subscriptions/usage')
+  return response.data
+}
+
+export async function createSubscriptionUsage(payload: {
+  subscription_id: number
+  usage_date?: string
+  users_used?: number
+  vehicles_used?: number
+  drivers_used?: number
+  storage_used_gb?: number
+  api_calls?: number
+  ai_requests?: number
+}): Promise<SubscriptionUsage> {
+  const response = await api.post<SubscriptionUsage>('/api/subscriptions/usage', payload)
+  return response.data
+}
+
+export async function listSubscriptionEvents(): Promise<SubscriptionEvent[]> {
+  const response = await api.get<SubscriptionEvent[]>('/api/subscriptions/events')
+  return response.data
+}
+
+export async function createSubscriptionEvent(payload: {
+  subscription_id: number
+  event_type: string
+  event_details?: Record<string, unknown>
+}): Promise<SubscriptionEvent> {
+  const response = await api.post<SubscriptionEvent>('/api/subscriptions/events', payload)
+  return response.data
+}
+
+export async function listPaymentWebhooks(): Promise<PaymentWebhook[]> {
+  const response = await api.get<PaymentWebhook[]>('/api/subscriptions/webhooks')
+  return response.data
+}
+
+export async function createPaymentWebhook(payload: {
+  provider_id: number
+  event_type: string
+  payload?: Record<string, unknown>
+  processed?: boolean
+  processed_at?: string
+}): Promise<PaymentWebhook> {
+  const response = await api.post<PaymentWebhook>('/api/subscriptions/webhooks', payload)
+  return response.data
+}
+
+export async function listFeatures(): Promise<Feature[]> {
+  const response = await api.get<Feature[]>('/api/subscriptions/features')
+  return response.data
+}
+
+export async function createFeature(payload: {
+  feature_code: string
+  feature_name: string
+  description?: string
+}): Promise<Feature> {
+  const response = await api.post<Feature>('/api/subscriptions/features', payload)
+  return response.data
+}
+
+export async function listPlanFeatures(planId: number): Promise<Feature[]> {
+  const response = await api.get<Feature[]>(`/api/subscriptions/plans/${planId}/features`)
+  return response.data
+}
+
+export async function assignPlanFeatures(planId: number, feature_ids: number[]): Promise<{ message: string }> {
+  const response = await api.put<{ message: string }>(`/api/subscriptions/plans/${planId}/features`, {
+    feature_ids,
+  })
+  return response.data
+}
+

@@ -1,0 +1,1120 @@
+import { api } from '../api'
+
+const LOAN_REPOSITORY_IMPORT_TIMEOUT_MS = 600000
+const LOAN_REPOSITORY_EXPORT_TIMEOUT_MS = 120000
+const LOAN_REPOSITORY_FETCH_TIMEOUT_MS = 12000
+const LOAN_REPOSITORY_FETCH_RETRIES = 0
+
+export type WorkflowStatus =
+  | 'Draft'
+  | 'Submitted'
+  | 'Under Review'
+  | 'Credit Review'
+  | 'Approved'
+  | 'Rejected'
+  | 'Released'
+
+export type ProductType = 'Home Loan' | 'Auto Loan' | 'Motorcycle Loan' | 'Credit Card' | 'Personal Loan' | 'Margin Loan'
+
+export interface LoanApplicationRequirements {
+  buildProfile?: Record<string, unknown>
+  productInformation: {
+    productType: ProductType
+    homePurposeOfLoan: string
+    homeDesiredLoanAmount: number
+    homeLoanTerm: number
+    homeCollateralType: string
+    autoPurpose: string
+    autoVehicleClassification: string
+    autoUnitModel: string
+    autoYearModel: string
+    autoSellingPrice: number
+    autoDesiredLoanAmount: number
+    autoDownPayment: number
+    autoYearsToPay: number
+    creditCardType: string
+    creditCardExtensionRequested: boolean
+  }
+  applicantPersonal: {
+    lastName: string
+    firstName: string
+    middleName: string
+    dateOfBirth: string
+    placeOfBirth: string
+    age: number
+    gender: string
+    citizenship: string
+    numberOfDependents: number
+    maritalStatus: string
+    mothersMaidenName: string
+  }
+  dependents?: Array<{
+    name: string
+    dateOfBirth: string
+  }>
+  contactInformation: {
+    mobileNumber: string
+    mobileYearsUsed: string
+    homePhoneNumber: string
+    emailAddress: string
+    emailYearsUsed: string
+  }
+  governmentIds: {
+    tin: string
+    sssGsisNumber: string
+    otherGovernmentId: string
+    idNumber: string
+    issueDate: string
+    expiryDate: string
+  }
+  addressInformation: {
+    presentAddress: string
+    permanentAddress: string
+    mailingAddress: string
+    lengthOfStay: string
+  }
+  otherInformation: {
+    homeOwnership: string
+    educationalAttainment: string
+    numberOfVehiclesOwned: number
+    recentPhotoUploaded: boolean
+    deviceVerified: boolean
+    hasCoBorrower?: boolean
+  }
+  employmentInformation: {
+    employmentStatus: string
+    employmentLocation: string
+    employerBusinessName: string
+    employerBusinessYears: number
+    officeAddress: string
+    occupation: string
+    position: string
+    natureOfWorkBusiness: string
+    dateHired: string
+    officePhoneNumber: string
+    previousEmployer: string
+    totalYearsWorking: string
+    grossMonthlyIncome: number
+    monthlyLivingExpenses: number
+    otherSourcesOfIncome: number
+    investmentIncome: number
+    businessIncome: number
+    pensionIncome: number
+    otherIncome: string
+  }
+  collateralInformation: {
+    propertyAddress: string
+    registeredOwner: string
+    lotNumber: string
+    blockNumber: string
+    tctCctNumber: string
+    propertyMarketabilityCategory: string
+    houseUnitModelCategory: string
+    collateralOccupancyType: string
+    propertyAppraisedValue: number
+  }
+  collateralAssetDetails: {
+    securityClassification: string
+    assetType: string
+    maker: string
+    brand: string
+    model: string
+    year: string
+    vehicleMarketabilityCategory: string
+    vehicleConditionCategory: string
+    vehicleTypeCategory: string
+    motorcycleIntendedUse: string
+    useAsCollateral: boolean
+    insuranceProviderCompany: string
+    policyNumber: string
+    orNumber: string
+    crNumber: string
+    additionalCollaterals: Array<{
+      collateralType: string
+      propertyType: string
+      maker: string
+      brand: string
+      model: string
+      year: string
+      appraisedValue: number
+      insuranceProviderCompany: string
+      policyNumber: string
+      orNumber: string
+      crNumber: string
+      tctCctNumber: string
+      notes: string
+    }>
+  }
+  spouseInformation: {
+    fullName: string
+    dateOfBirth: string
+    placeOfBirth: string
+    citizenship: string
+    mobileNumber: string
+    presentAddress: string
+    employerBusinessName: string
+    officeAddress: string
+    occupation: string
+    position: string
+    natureOfWork: string
+    yearsWithEmployer: string
+    previousEmployer: string
+    totalYearsWorking: string
+    grossMonthlyIncome: number
+    monthlyExpenses: number
+    otherIncomeSources: string
+  }
+  coBorrowers?: Array<{
+    name: string
+    relationship: string
+    employerBusinessName?: string
+    officeAddress?: string
+    occupation?: string
+    position?: string
+    natureOfWork?: string
+    previousEmployer?: string
+    yearsWithEmployer?: string
+    totalYearsWorking?: string
+    monthlyIncome: number
+    monthlyExpenses?: number
+    otherIncomeSources?: string
+    debtObligations: number
+    creditStanding: string
+  }>
+  bankingRelationships: {
+    creditCardIssuer: string
+    creditCardNumber: string
+    creditPaymentHistory: string
+    creditCardRelationshipStatus: string
+    creditLimit: number
+    outstandingBalance: number
+    memberSince: string
+    bankBranch: string
+    accountType: string
+    accountNumber: string
+    currentBalance: number
+    averageSavingsBalance: number
+    averageDailyBalance: number
+    depositRegularity: string
+    bankingRelationshipTier: string
+    accountHandling: string
+    utilityCreditBureauStatus: string
+    loanLender: string
+    loanType: string
+    loanCurrentBalance: number
+    loanMonthlyAmortization: number
+  }
+  signatures: {
+    applicantSignature: string
+    spouseOrCoBorrowerSignature: string
+    borrowerSignatureAutoLoanInsurance: string
+    extensionCardholderSignature: string
+  }
+  supportingDocuments: {
+    validGovernmentId: boolean
+    selfiePhotoOptional?: boolean
+    passportIfApplicable: boolean
+    driversLicense: boolean
+    philSysId: boolean
+    certificateOfEmployment: boolean
+    latestPayslips: boolean
+    latestItr: boolean
+    dtiSecRegistration: boolean
+    businessPermit: boolean
+    financialStatements: boolean
+    utilityBill: boolean
+    waterBill: boolean
+    internetBill: boolean
+    titleTctCct: boolean
+    taxDeclaration: boolean
+    lotPlan: boolean
+    propertyPhotos: boolean
+    vehicleQuotation: boolean
+    vehicleInvoice: boolean
+    orCrForRefinancing: boolean
+    proofOfIncome: boolean
+    bankStatements: boolean
+    existingCreditCardStatements: boolean
+    additionalSupportingDocuments: boolean
+    auditedFinancialStatements: boolean
+    proofOfRemittanceIncome: boolean
+    investmentStatements: boolean
+  }
+  enhancedDueDiligence: {
+    previousLendersAndExistingLoanAccounts: string
+    numberOfActiveLoans: number
+    previousLoanRestructuringDisclosures: string
+    lifestyleIndicator: string
+    secondaryIncomeProfile: string
+    employmentReferencePerson: string
+    hrContactInformation: string
+    supervisorInformation: string
+    additionalBankAccountsOwned: string
+    sourceOfIncomeVerificationReferences: string
+    lengthOfResidenceConfirmation: string
+    utilityAccountReferences: string
+    digitalBankingUsage: string
+    characterReferences: string
+    communityReputation: string
+    professionalOrganizationMemberships: string
+    professionalLicenses: string
+    facebookProfile: string
+    instagramProfile: string
+    xProfile: string
+    tikTokProfile: string
+    linkedInProfile: string
+    otherSocialMediaLinks: string
+    businessWebsite: string
+    guarantorReferences: string
+    coBorrowerReferences: string
+    additionalPropertyDeclarations: string
+    additionalVehicleDeclarations: string
+    selfDeclaredAssetsAndLiabilities: string
+    selfDeclaredInvestmentPortfolio: string
+    existingInsurancePolicies: string
+    priorBankingRelationships: string
+    consentOpenBankingDataAccess: boolean
+    consentEmploymentVerification: boolean
+    consentIdentityVerification: boolean
+    psychometricQuestionnaireResponses: string
+    financialBehaviorQuestionnaireResponses: string
+    riskAppetiteQuestionnaireResponses: string
+    businessOutlookQuestionnaireResponses: string
+    futureFinancialPlansQuestionnaire: string
+    spendingBehaviorQuestionnaire: string
+    householdBudgetingQuestionnaire: string
+    emergencyPreparednessQuestionnaire: string
+    characterAndIntegrityAssessmentAnswers: string
+    communityInvolvementInformation: string
+    referencesFromEmployerOrCommunity: string
+  }
+  fraudVerification: {
+    faceMatchScore: number
+    livenessDetection: string
+    incomeDocumentsStatus: string
+    employmentVerificationStatus: string
+    bankStatementVerificationStatus: string
+    payrollVerificationStatus: string
+    bankAccountOwnershipStatus: string
+  }
+  documentAnalysis: {
+    ocrAnalysisStatus: string
+  }
+  deviceRisk: {
+    deviceReputation: string
+    ipAddressRisk: string
+    deviceConsistency: string
+  }
+  fraudIntelligence: {
+    watchlistStatus: string
+    previousFraudRecords: string
+    applicationVelocity: string
+    fakeNationalId: boolean
+    forgedPayslip: boolean
+    forgedBankStatement: boolean
+    identityTheftIndicator: boolean
+    sanctionsPepMatch: boolean
+  }
+  optionalPsychometricQuestionnaire: {
+    question01: string
+    question02: string
+    question03: string
+    question04: string
+    question05: string
+    question06: string
+    question07: string
+    question08: string
+    question09: string
+    question10: string
+    question11: string
+    question12: string
+    question13: string
+    question14: string
+    question15: string
+    question16: string
+    question17: string
+    question18: string
+    question19: string
+    question20: string
+  }
+  psychometricAssessment: Record<string, string>
+  editorState?: {
+    documents?: Array<{
+      id: string
+      name: string
+      type: string
+      parsedData?: string
+      status: 'Pending' | 'Parsed' | 'Failed'
+    }>
+    routing?: {
+      creditOfficer: string
+      branchManager: string
+      creditCommittee: string
+    }
+    disbursement?: {
+      bankAccount: string
+      accountNumber: string
+      disbursementDate: string
+      bookingDate: string
+      startRepaymentDate: string
+      firstPaymentDate: string
+    }
+  }
+  releaseReadiness?: {
+    finalChecklist?: {
+      allRequiredDocumentsProvided: boolean
+      allSignaturesCollected: boolean
+      creditCommitteeApproved: boolean
+      executiveApprovalObtained: boolean
+      collateralDocumentationReady: boolean
+      creditImprovementActionsTracked: boolean
+    }
+    releaseNotes?: string
+    advisorChecklist?: Array<{
+      id: string
+      text: string
+      done: boolean
+    }>
+  }
+}
+
+export interface CreditScoreRecord {
+  id?: number
+  created_at?: string
+  character_score?: number | null
+  capacity_score?: number | null
+  capital_score?: number | null
+  collateral_score?: number | null
+  conditions_score?: number | null
+  bureau_score?: number | null
+  internal_score?: number | null
+  total_credit_score?: number | null
+  credit_grade?: string | null
+  model_version?: string | null
+}
+
+export interface FraudScoreRecord {
+  id?: number
+  created_at?: string
+  identity_score?: number | null
+  document_score?: number | null
+  geo_location_score?: number | null
+  device_score?: number | null
+  duplicate_application_score?: number | null
+  overall_fraud_score?: number | null
+  fraud_risk_level?: string | null
+  fraud_flags?: Record<string, unknown>
+}
+
+export interface SocialScoreRecord {
+  social_risk_level: string
+  id?: number
+  created_at?: string
+  residence_stability_score?: number | null
+  employment_stability_score?: number | null
+  family_stability_score?: number | null
+  education_score?: number | null
+  banking_relationship_score?: number | null
+  overall_social_score?: number | null
+}
+
+export interface PsychometricScoreRecord {
+  psychometric_risk_level: string
+  id?: number
+  created_at?: string
+  discipline_score?: number | null
+  planning_score?: number | null
+  responsibility_score?: number | null
+  honesty_score?: number | null
+  resilience_score?: number | null
+  overall_psychometric_score?: number | null
+  questionnaire_answers?: Record<string, unknown>
+}
+
+export interface CreditBureauReportRecord {
+  id?: number
+  created_at?: string
+  bureau_name?: string | null
+  bureau_score?: number | null
+  total_loans?: number | null
+  active_loans?: number | null
+  closed_loans?: number | null
+  delinquent_accounts?: number | null
+  defaulted_accounts?: number | null
+  outstanding_balance?: number | null
+  report_json?: Record<string, unknown>
+  report_date?: string | null
+}
+
+export interface CollateralScoreRecord {
+  id?: number
+  created_at?: string
+  ltv_score?: number | null
+  asset_quality_score?: number | null
+  marketability_score?: number | null
+  insurance_score?: number | null
+  overall_collateral_score?: number | null
+}
+
+export interface ProfitabilityScoreRecord {
+  id?: number
+  created_at?: string
+  projected_interest_income?: number | null
+  fee_income?: number | null
+  expected_loss?: number | null
+  operating_cost?: number | null
+  funding_cost?: number | null
+  projected_profit?: number | null
+  profitability_score?: number | null
+}
+
+export interface RelationshipScoreRecord {
+  id?: number
+  created_at?: string
+  customer_since?: string | null
+  number_of_accounts?: number | null
+  deposit_balance?: number | null
+  prior_loans?: number | null
+  relationship_score?: number | null
+}
+
+export interface AIRecommendationRecord {
+  id?: number
+  created_at?: string
+  recommendation?: string | null
+  confidence_score?: number | null
+  explanation?: string | null
+  suggested_amount?: number | null
+  ai_model?: string | null
+}
+
+export interface OverallScoreRecord {
+  id?: number
+  created_at?: string
+  credit_score?: number | null
+  fraud_score?: number | null
+  social_score?: number | null
+  psychometric_score?: number | null
+  collateral_score?: number | null
+  profitability_score?: number | null
+  relationship_score?: number | null
+  final_score?: number | null
+  composite_score?: number | null
+  final_grade?: string | null
+  final_rating?: string | null
+  final_decision?: string | null
+  wealth_building_score?: number | null
+  wealth_grade?: string | null
+  wealth_rating?: string | null
+  wealth_component_scores?: Record<string, number> | null
+  wealth_calculated_at?: string | null
+  wealth_certification_status?: WealthCertificationStatus | null
+}
+
+export type WealthCertificationStatus =
+  | 'NOT_GENERATED'
+  | 'GENERATED_PENDING'
+  | 'GENERATED_COMPLETE'
+
+export interface WealthScoreUpdatePayload {
+  wealth_building_score: number
+  wealth_grade: string
+  wealth_rating: string
+  wealth_component_scores: Record<string, number>
+  wealth_certification_status: WealthCertificationStatus
+}
+
+export interface WealthScoreUpdateResponse extends LoanMutationResponse {
+  wealth_score: WealthScoreUpdatePayload & {
+    wealth_calculated_at: string
+  }
+}
+
+export interface DecisionAuditTrailRecord {
+  id?: number
+  changed_at?: string
+  previous_status?: string | null
+  new_status?: string | null
+  remarks?: string | null
+  changed_by?: string | null
+}
+
+export interface LoanApplicationProfileColumns {
+  last_name?: string | null
+  first_name?: string | null
+  middle_name?: string | null
+  date_of_birth?: string | null
+  place_of_birth?: string | null
+  age?: number | null
+  gender?: string | null
+  citizenship?: string | null
+  number_of_dependents?: number | null
+  marital_status?: string | null
+  mothers_maiden_name?: string | null
+  mobile_number?: string | null
+  home_phone_number?: string | null
+  tin?: string | null
+  sss_gsis_number?: string | null
+  other_government_id?: string | null
+  id_number?: string | null
+  issue_date?: string | null
+  expiry_date?: string | null
+  present_address?: string | null
+  permanent_address?: string | null
+  mailing_address?: string | null
+  length_of_stay?: string | null
+  home_ownership?: string | null
+  educational_attainment?: string | null
+  number_of_vehicles_owned?: number | null
+  recent_photo_uploaded?: boolean | null
+  employment_status?: string | null
+  employer_business_name?: string | null
+  office_address?: string | null
+  occupation?: string | null
+  position?: string | null
+  nature_of_work_business?: string | null
+  date_hired?: string | null
+  office_phone_number?: string | null
+  previous_employer?: string | null
+  total_years_working?: string | null
+  gross_monthly_income?: number | null
+  monthly_living_expenses?: number | null
+  other_sources_of_income?: string | null
+  investment_income?: number | null
+  business_income?: number | null
+  pension_income?: number | null
+  insurance?: string | null
+  registration?: string | null
+  property_address?: string | null
+  registered_owner?: string | null
+  lot_number?: string | null
+  block_number?: string | null
+  tct_cct_number?: string | null
+  spouse_name?: string | null
+  spouse_date_of_birth?: string | null
+  spouse_place_of_birth?: string | null
+  spouse_citizenship?: string | null
+  spouse_mobile_number?: string | null
+  spouse_present_address?: string | null
+  spouse_employer_business_name?: string | null
+  spouse_office_address?: string | null
+  spouse_occupation?: string | null
+  spouse_position?: string | null
+  spouse_nature_of_work?: string | null
+  spouse_years_with_employer?: string | null
+  spouse_previous_employer?: string | null
+  spouse_total_years_working?: string | null
+  spouse_gross_monthly_income?: number | null
+  spouse_monthly_expenses?: number | null
+  spouse_other_income_sources?: string | null
+  credit_card_issuer?: string | null
+  credit_card_number?: string | null
+  credit_limit?: number | null
+  outstanding_balance?: number | null
+  member_since?: string | null
+  bank_branch?: string | null
+  account_type?: string | null
+  account_number?: string | null
+  current_balance?: number | null
+  loan_lender?: string | null
+  loan_type?: string | null
+  loan_current_balance?: number | null
+  loan_monthly_amortization?: number | null
+  co_borrower_name?: string | null
+  co_borrower_relationship?: string | null
+  co_borrower_monthly_income?: number | null
+  guarantor_name?: string | null
+  guarantor_mobile?: string | null
+  guarantor_address?: string | null
+  guarantor_relationship?: string | null
+  guarantor_monthly_income?: number | null
+  enhanced_due_diligence?: string | null
+  identity_verification_status?: string | null
+  document_verification_status?: string | null
+  banking_verification_status?: string | null
+  device_verification_status?: string | null
+  questionnaire_responses?: Record<string, unknown> | null
+  asset_details?: Record<string, unknown> | null
+  liability_details?: Array<Record<string, unknown>> | null
+  additional_loan_details?: Array<Record<string, unknown>> | null
+  bank_account_details?: Record<string, unknown> | null
+  credit_history_details?: Record<string, unknown> | null
+  financial_goal_target_amount?: number | null
+  financial_goal_target_period?: number | null
+  financial_goal_target_period_unit?: string | null
+  credit_officer?: string | null
+  branch_manager?: string | null
+  credit_committee?: string | null
+  bank_account?: string | null
+  disbursement_account_number?: string | null
+  disbursement_date?: string | null
+  booking_date?: string | null
+  start_repayment_date?: string | null
+  first_payment_date?: string | null
+  all_required_documents_provided?: boolean | null
+  all_signatures_collected?: boolean | null
+  credit_committee_approved?: boolean | null
+  executive_approval_obtained?: boolean | null
+  collateral_documentation_ready?: boolean | null
+}
+
+export interface LoanApplicationPayload extends LoanApplicationProfileColumns {
+  application_no: string
+  status: WorkflowStatus
+  product_type: ProductType
+  client_name?: string
+  borrower_name: string
+  email: string
+  phone: string
+  gov_id: string
+  address: string
+  monthly_income: number
+  other_income: number
+  debt_obligations: number
+  loan_amount: number
+  term_months: number
+  interest_rate: number
+  purpose: string
+  vehicle_info: string
+  appraised_value: number
+  committee_remarks: string
+  executive_approval: boolean
+  dti: number
+  dsr: number
+  ltv: number
+  scorecard_total: number
+  ai_probability: number
+  requirements: LoanApplicationRequirements
+  credit_scores: CreditScoreRecord
+  fraud_scores: FraudScoreRecord
+  social_scores: SocialScoreRecord
+  psychometric_scores: PsychometricScoreRecord
+  credit_bureau_reports: CreditBureauReportRecord
+  collateral_scores: CollateralScoreRecord
+  profitability_scores: ProfitabilityScoreRecord
+  relationship_scores: RelationshipScoreRecord
+  ai_recommendations: AIRecommendationRecord
+  overall_scores: OverallScoreRecord
+  decision_audit_trail?: DecisionAuditTrailRecord[]
+}
+
+export interface LoanApplicationRecord extends LoanApplicationPayload {
+  psychometric_risk_level: string
+  id?: number
+  created_by_username?: string
+  created_by_email?: string | null
+  created_at?: string
+  updated_at?: string
+}
+
+export interface LoanMutationResponse {
+  message: string
+  application_no?: string
+}
+
+export interface LoanScorecardSnapshotRecord {
+  id: number
+  loan_application_id: number
+  snapshot_date: string
+  finalized_at: string
+  finalized_by: number | null
+  final_status: 'FINAL' | 'APPROVED' | 'RELEASED'
+  overall_score: number | null
+  grade: string | null
+  rating: string | null
+  decision: string | null
+  scorecard_payload: Record<string, unknown>
+  created_at: string
+}
+
+export interface QuantScoresSummary {
+  credit_score: number
+  credit_bureau_score: number
+  fraud_score: number
+  social_score: number
+  psychometric_score: number
+  relationship_score: number
+  profitability_score: number
+  overall_score: number
+  composite_score: number
+  final_grade: string
+  final_rating: string
+  decision: string
+}
+
+export interface QuantScoresApiSummary {
+  creditScore: number
+  creditBureauScore: number
+  fraudScore: number
+  socialScore: number
+  psychometricScore: number
+  relationshipScore: number
+  profitabilityScore: number
+  overallScore: number
+  compositeScore?: number
+  finalGrade: string
+  finalRating?: string
+  decision: string
+}
+
+export interface QuantScoresResponse extends LoanMutationResponse {
+  quant_scores: QuantScoresApiSummary
+  persisted?: boolean
+}
+
+export interface LoanCreationEntitlementResponse {
+  allowed: boolean
+  reason: string
+  message: string
+  role_code: string
+  records_in_free_window: number
+  records_this_month: number
+  free_limit: number
+  free_days: number
+  free_window_active: boolean
+  amount_due_this_month: number
+  has_paid_current_period: boolean
+}
+
+export interface LoanBulkMutationResponse {
+  inserted: number
+  message: string
+  skipped: number
+  updated: number
+}
+
+const LOAN_APPLICATIONS_PATH = '/api/loan-applications'
+
+export interface LoanApplicationQueryParams {
+  dateFrom?: string
+  dateTo?: string
+  limit?: number
+  offset?: number
+  summary?: boolean
+  status?: 'All' | WorkflowStatus | string
+}
+
+export interface DashboardStatistics {
+  totalApplications: number
+  approved: number
+  pending: number
+  rejected: number
+}
+
+export interface LoanApplicationsPageResponse {
+  total: number
+  limit: number
+  offset: number
+  records: LoanApplicationRecord[]
+}
+
+export async function fetchDashboardStatistics(): Promise<DashboardStatistics> {
+  const response = await api.get<DashboardStatistics>('/dashboard/statistics', {
+    timeout: LOAN_REPOSITORY_FETCH_TIMEOUT_MS,
+  })
+  return response.data
+}
+
+async function fetchLoanApplicationsPage(
+  params: LoanApplicationQueryParams = {},
+): Promise<LoanApplicationsPageResponse> {
+  for (let attempt = 0; attempt <= LOAN_REPOSITORY_FETCH_RETRIES; attempt += 1) {
+    try {
+      const response = await api.get<LoanApplicationsPageResponse>(LOAN_APPLICATIONS_PATH, {
+        params: {
+          date_from: params.dateFrom || undefined,
+          date_to: params.dateTo || undefined,
+          limit: params.limit,
+          offset: params.offset,
+          summary: params.summary || undefined,
+          status: params.status && params.status !== 'All' ? params.status : undefined,
+        },
+        timeout: LOAN_REPOSITORY_FETCH_TIMEOUT_MS,
+      })
+      return response.data
+    } catch (error) {
+      if (attempt >= LOAN_REPOSITORY_FETCH_RETRIES) {
+        throw error
+      }
+    }
+  }
+
+  throw new Error('Failed to fetch loan applications page')
+}
+
+export async function fetchLoanApplications(
+  params: LoanApplicationQueryParams = {},
+): Promise<LoanApplicationRecord[]> {
+  if (params.limit !== undefined || params.offset !== undefined) {
+    const response = await fetchLoanApplicationsPage(params)
+    return response.records
+  }
+
+  return fetchAllLoanApplications(params)
+}
+
+export async function fetchAllLoanApplications(
+  params: Omit<LoanApplicationQueryParams, 'limit' | 'offset'> & {
+    maxRecords?: number
+  } = {},
+): Promise<LoanApplicationRecord[]> {
+  const allRecords: LoanApplicationRecord[] = []
+  const pageSize = 100
+  const maxRecords = typeof params.maxRecords === 'number' ? Math.max(0, params.maxRecords) : null
+
+  for (let offset = 0; ; offset += pageSize) {
+    const remaining = maxRecords === null ? pageSize : maxRecords - allRecords.length
+    if (remaining <= 0) {
+      break
+    }
+
+    const batch = await fetchLoanApplicationsPage({
+      ...params,
+      limit: Math.min(pageSize, remaining),
+      offset,
+    })
+
+    allRecords.push(...batch.records)
+
+    if (batch.records.length < Math.min(pageSize, remaining)) {
+      break
+    }
+  }
+
+  return allRecords
+}
+
+export async function importLoanApplications(
+  file: File,
+): Promise<LoanBulkMutationResponse> {
+  const formData = new FormData()
+  formData.append('file', file)
+
+  const response = await api.post<LoanBulkMutationResponse>(
+    `${LOAN_APPLICATIONS_PATH}/import`,
+    formData,
+    {
+      timeout: LOAN_REPOSITORY_IMPORT_TIMEOUT_MS,
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    },
+  )
+
+  return response.data
+}
+
+export async function exportLoanApplications(params: {
+  dateFrom?: string
+  dateTo?: string
+  format: 'csv' | 'xlsx'
+  status?: 'All' | WorkflowStatus
+}): Promise<Blob> {
+  const response = await api.get<Blob>(`${LOAN_APPLICATIONS_PATH}/export`, {
+    timeout: LOAN_REPOSITORY_EXPORT_TIMEOUT_MS,
+    params: {
+      date_from: params.dateFrom || undefined,
+      date_to: params.dateTo || undefined,
+      format: params.format,
+      status: params.status && params.status !== 'All' ? params.status : undefined,
+    },
+    responseType: 'blob',
+  })
+
+  return response.data
+}
+
+export async function fetchLoanApplication(
+  applicationNo: string,
+): Promise<LoanApplicationRecord> {
+  const response = await api.get<LoanApplicationRecord>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}`,
+  )
+  return response.data
+}
+
+export async function createLoanScorecardSnapshot(
+  applicationNo: string,
+  snapshotDate: string,
+): Promise<LoanScorecardSnapshotRecord> {
+  const response = await api.post<LoanScorecardSnapshotRecord>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}/scorecard-snapshots`,
+    { snapshot_date: snapshotDate },
+  )
+  return response.data
+}
+
+export async function fetchLoanScorecardSnapshots(
+  applicationNo: string,
+): Promise<LoanScorecardSnapshotRecord[]> {
+  const response = await api.get<LoanScorecardSnapshotRecord[]>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}/scorecard-snapshots`,
+  )
+  return response.data
+}
+
+type WorkflowSaveResponse = {
+  application_no: string
+  message: string
+  saved?: number
+}
+
+export type NetWorthRecordPayload = {
+  snapshot_date: string
+  client_name?: string
+  total_assets: number
+  total_liabilities: number
+  net_worth: number
+  monthly_income: number
+  monthly_expenses: number
+  savings_rate: number
+}
+
+export type BudgetRecordPayload = {
+  budget_month: string
+  category: string
+  budget_amount: number
+  actual_amount: number
+  variance: number
+}
+
+export type MonitoringRecordPayload = {
+  monitoring_date: string
+  outstanding_balance: number
+  principal_paid: number
+  interest_paid: number
+  monthly_payment: number
+  days_past_due: number
+  loan_status: string
+  dsr: number
+  ltv: number
+  risk_level: string
+}
+
+export type BillReminderRecordPayload = {
+  bill_type: string
+  biller_name: string
+  amount_due: number
+  due_date: string | null
+  payment_date: string | null
+  payment_status: string
+  reminder_enabled: boolean
+  reminder_days_before: number
+  reminder_sent: boolean
+}
+
+export async function saveLoanApplicationNetWorth(
+  applicationNo: string,
+  payload: NetWorthRecordPayload,
+): Promise<WorkflowSaveResponse> {
+  const response = await api.put<WorkflowSaveResponse>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}/net-worth`,
+    payload,
+  )
+  return response.data
+}
+
+export async function saveLoanApplicationBudget(
+  applicationNo: string,
+  records: BudgetRecordPayload[],
+): Promise<WorkflowSaveResponse> {
+  const response = await api.put<WorkflowSaveResponse>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}/budget`,
+    { records },
+  )
+  return response.data
+}
+
+export async function saveLoanApplicationMonitoring(
+  applicationNo: string,
+  payload: MonitoringRecordPayload,
+): Promise<WorkflowSaveResponse> {
+  const response = await api.put<WorkflowSaveResponse>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}/monitoring`,
+    payload,
+  )
+  return response.data
+}
+
+export async function saveLoanApplicationBillReminders(
+  applicationNo: string,
+  records: BillReminderRecordPayload[],
+): Promise<WorkflowSaveResponse> {
+  const response = await api.put<WorkflowSaveResponse>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}/bill-reminders`,
+    { records },
+  )
+  return response.data
+}
+
+export async function createLoanApplication(
+  payload: LoanApplicationPayload,
+): Promise<LoanMutationResponse> {
+  const response = await api.post<LoanMutationResponse>(
+    LOAN_APPLICATIONS_PATH,
+    payload,
+  )
+  return response.data
+}
+
+export async function updateLoanApplication(
+  applicationNo: string,
+  payload: LoanApplicationPayload,
+): Promise<LoanMutationResponse> {
+  const response = await api.put<LoanMutationResponse>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}`,
+    payload,
+  )
+  return response.data
+}
+
+export async function updateLoanApplicationStatus(
+  applicationNo: string,
+  status: WorkflowStatus,
+): Promise<LoanMutationResponse> {
+  const response = await api.put<LoanMutationResponse>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}/status`,
+    null,
+    {
+      params: { status },
+    },
+  )
+  return response.data
+}
+
+export async function computeQuantScores(
+  payload: LoanApplicationPayload,
+): Promise<QuantScoresResponse> {
+  const response = await api.post<QuantScoresResponse>(
+    `${LOAN_APPLICATIONS_PATH}/compute-quant-scores`,
+    payload,
+  )
+  return response.data
+}
+
+export async function recomputeStoredLoanApplicationScores(
+  applicationNo: string,
+): Promise<QuantScoresResponse> {
+  const response = await api.post<QuantScoresResponse>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}/compute-quant-scores`,
+  )
+  return response.data
+}
+
+export async function updateLoanApplicationWealthScore(
+  applicationNo: string,
+  payload: WealthScoreUpdatePayload,
+): Promise<WealthScoreUpdateResponse> {
+  const response = await api.patch<WealthScoreUpdateResponse>(
+    `${LOAN_APPLICATIONS_PATH}/${encodeURIComponent(applicationNo)}/wealth-score`,
+    payload,
+  )
+  return response.data
+}
+
+export async function fetchLoanCreationEntitlement(): Promise<LoanCreationEntitlementResponse> {
+  const response = await api.get<LoanCreationEntitlementResponse>(
+    '/api/subscriptions/entitlement/loan-record-create',
+  )
+  return response.data
+}

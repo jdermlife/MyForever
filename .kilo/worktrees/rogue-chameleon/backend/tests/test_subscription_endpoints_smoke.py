@@ -1,0 +1,676 @@
+from __future__ import annotations
+
+from datetime import date, datetime, timezone, timedelta
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.database import get_db
+from app.models.subscription import (
+    Feature,
+    StoreProduct,
+    StorePurchase,
+    Subscription,
+    SubscriptionPayment,
+    SubscriptionPlan,
+)
+from app.models.users import User
+from app.routes import subscriptions as subscription_routes
+from app.routes.subscriptions import router as subscriptions_router
+from app.services.store_billing import VerifiedStorePurchase
+from security.auth import create_token
+
+
+class FakeQuery:
+    def __init__(self, rows: list[object]):
+        self._rows = rows
+
+    def _extract(self, criterion) -> tuple[str | None, object | None]:
+        left = getattr(criterion, "left", None)
+        right = getattr(criterion, "right", None)
+        key = getattr(left, "key", None)
+        value = getattr(right, "value", None)
+        if value is None and right is not None:
+            value = getattr(right, "effective_value", None)
+        if value is None and right is not None:
+            boolean_literal = type(right).__name__
+            if boolean_literal == "True_":
+                value = True
+            elif boolean_literal == "False_":
+                value = False
+        return key, value
+
+    def filter(self, *criteria):
+        for criterion in criteria:
+            key, value = self._extract(criterion)
+            if key is None:
+                continue
+            self._rows = [
+                row
+                for row in self._rows
+                if (
+                    getattr(row, key, None)
+                    if hasattr(row, key)
+                    else getattr(getattr(row, "subscription", None), key, None)
+                ) == value
+            ]
+        return self
+
+    def join(self, *_args, **_kwargs):
+        return self
+
+    def order_by(self, *_args, **_kwargs):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def delete(self):
+        deleted = len(self._rows)
+        self._rows = []
+        return deleted
+
+
+class FakeSession:
+    def __init__(self):
+        self.rows_by_model: dict[type, list[object]] = {}
+
+    def query(self, model):
+        return FakeQuery(list(self.rows_by_model.get(model, [])))
+
+    def add(self, row):
+        model = type(row)
+        bucket = self.rows_by_model.setdefault(model, [])
+        if getattr(row, "id", None) is None:
+            setattr(row, "id", len(bucket) + 1)
+        bucket.append(row)
+
+    def commit(self):
+        return None
+
+    def flush(self):
+        return None
+
+    def refresh(self, _row):
+        return None
+
+    def close(self):
+        return None
+
+
+@pytest.fixture
+def fake_db(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(subscription_routes, "SessionLocal", lambda: session)
+    return session
+
+
+@pytest.fixture
+def client(fake_db):
+    auth_db = FakeSession()
+    auth_db.rows_by_model[User] = [
+        User(
+            id=1,
+            username="admin",
+            email="admin@example.com",
+            password_hash="unused",
+            role="admin",
+            is_active=True,
+            account_status="ACTIVE",
+        ),
+        User(
+            id=42,
+            username="subscriber",
+            email="subscriber@example.com",
+            password_hash="unused",
+            role="subscriber",
+            is_active=True,
+            account_status="ACTIVE",
+        ),
+    ]
+    app = FastAPI()
+    app.include_router(subscriptions_router, prefix="/api")
+    app.dependency_overrides[get_db] = lambda: auth_db
+    return TestClient(app)
+
+
+@pytest.fixture
+def admin_headers():
+    token = create_token(user_id=1, username="admin", role="ADMIN")
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def subscriber_headers():
+    token = create_token(user_id=42, username="subscriber", role="SUBSCRIBER")
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_plans_create_and_list_smoke(client: TestClient, admin_headers):
+    create_response = client.post(
+        "/api/subscriptions/plans",
+        headers=admin_headers,
+        json={
+            "plan_code": "BASIC",
+            "plan_name": "Basic",
+            "billing_cycle": "MONTHLY",
+            "monthly_price": 999.0,
+        },
+    )
+    assert create_response.status_code == 200
+
+    list_response = client.get("/api/subscriptions/plans", headers=admin_headers)
+    assert list_response.status_code == 200
+    rows = list_response.json()
+    assert len(rows) == 1
+    assert rows[0]["plan_code"] == "BASIC"
+
+
+@pytest.mark.parametrize("platform", ["ANDROID", "IOS"])
+def test_native_inapp_verification_is_subscription_free_and_idempotent(
+    client: TestClient,
+    fake_db: FakeSession,
+    subscriber_headers,
+    monkeypatch,
+    platform,
+):
+    product = StoreProduct(
+        id=1,
+        plan_id=None,
+        platform=platform,
+        product_id="reports_unlock",
+        product_type="INAPP",
+        entitlement_category="REPORTS",
+        is_active=True,
+    )
+    fake_db.rows_by_model[StoreProduct] = [product]
+    verified = VerifiedStorePurchase(
+        platform=platform,
+        product_id="reports_unlock",
+        transaction_id="GPA.1234-5678" if platform == "ANDROID" else "2000000123456789",
+        original_transaction_id=None,
+        purchase_token_hash="a" * 64,
+        status="ACTIVE",
+        purchased_at=datetime.now(timezone.utc),
+        expires_at=None,
+    )
+    monkeypatch.setattr(subscription_routes, "verify_store_purchase", lambda *_args, **_kwargs: verified)
+
+    payload = {
+        "platform": platform,
+        "product_id": "reports_unlock",
+        "verification_data": "purchase-token",
+    }
+    first = client.post("/api/subscriptions/store-purchases/verify", headers=subscriber_headers, json=payload)
+    second = client.post("/api/subscriptions/store-purchases/verify", headers=subscriber_headers, json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["subscription_id"] is None
+    assert len(fake_db.rows_by_model.get(Subscription, [])) == 0
+    assert len(fake_db.rows_by_model[StorePurchase]) == 1
+    assert len(fake_db.rows_by_model[SubscriptionPayment]) == 1
+    assert fake_db.rows_by_model[SubscriptionPayment][0].subscription_id is None
+
+
+@pytest.mark.parametrize("platform", ["ANDROID", "IOS"])
+def test_store_entitlements_aggregate_inapp_and_paid_subscription(
+    client: TestClient,
+    fake_db: FakeSession,
+    subscriber_headers,
+    platform,
+):
+    reports_product = StoreProduct(
+        id=1,
+        platform=platform,
+        product_id="reports_unlock",
+        product_type="INAPP",
+        entitlement_category="REPORTS",
+        is_active=True,
+    )
+    fake_db.rows_by_model[StorePurchase] = [
+        StorePurchase(
+            id=1,
+            user_id=42,
+            store_product_id=1,
+            platform=platform,
+            transaction_id="GPA.REPORTS" if platform == "ANDROID" else "2000000123456789",
+            purchase_token_hash="b" * 64,
+            status="ACTIVE",
+            verified_at=datetime.now(timezone.utc),
+            store_product=reports_product,
+        )
+    ]
+
+    purchase_only = client.get("/api/subscriptions/me/store-entitlements", headers=subscriber_headers)
+
+    assert purchase_only.status_code == 200
+    assert purchase_only.json() == {
+        "subscription_grants_all": False,
+        "reports": True,
+        "statements": False,
+        "certifications": False,
+        "scores": False,
+    }
+
+    fake_db.rows_by_model[Subscription] = [
+        Subscription(
+            id=1,
+            subscription_no="SUB-PAID-001",
+            user_id=42,
+            plan_id=1,
+            status="ACTIVE",
+            subscription_type="PAID",
+            subscription_start=date.today(),
+        )
+    ]
+
+    subscribed = client.get("/api/subscriptions/me/store-entitlements", headers=subscriber_headers)
+
+    assert subscribed.status_code == 200
+    assert subscribed.json() == {
+        "subscription_grants_all": True,
+        "reports": True,
+        "statements": True,
+        "certifications": True,
+        "scores": True,
+    }
+
+
+def test_public_plans_endpoint_lists_only_active_public_plans_smoke(
+    client: TestClient,
+    fake_db: FakeSession,
+):
+    public_plan = SubscriptionPlan(
+        id=1,
+        plan_code="FREE",
+        plan_name="Free",
+        billing_cycle="MONTHLY",
+        is_active=True,
+        is_public=True,
+        display_order=1,
+    )
+    private_plan = SubscriptionPlan(
+        id=2,
+        plan_code="PRIVATE",
+        plan_name="Private",
+        billing_cycle="MONTHLY",
+        is_active=True,
+        is_public=False,
+        display_order=2,
+    )
+    inactive_plan = SubscriptionPlan(
+        id=3,
+        plan_code="OLD",
+        plan_name="Old",
+        billing_cycle="MONTHLY",
+        is_active=False,
+        is_public=True,
+        display_order=3,
+    )
+    fake_db.rows_by_model[SubscriptionPlan] = [public_plan, private_plan, inactive_plan]
+
+    response = client.get("/api/subscriptions/public-plans")
+
+    assert response.status_code == 200
+    rows = response.json()
+    assert len(rows) == 1
+    assert rows[0]["plan_code"] == "FREE"
+
+
+def test_free_plan_activates_two_day_internal_trial_once(
+    client: TestClient,
+    fake_db: FakeSession,
+    subscriber_headers,
+):
+    free_plan = SubscriptionPlan(
+        id=1,
+        plan_code="FREE",
+        plan_name="Free",
+        billing_cycle="MONTHLY",
+        monthly_price=0,
+        yearly_price=0,
+        is_active=True,
+        is_public=True,
+    )
+    account = User(
+        id=42,
+        username="subscriber",
+        email="subscriber@example.com",
+        password_hash="unused",
+        role="subscriber",
+        is_active=True,
+        account_status="ACTIVE",
+    )
+    fake_db.rows_by_model[SubscriptionPlan] = [free_plan]
+    fake_db.rows_by_model[User] = [account]
+
+    first_response = client.post("/api/subscriptions/create-free", headers=subscriber_headers, json={})
+
+    assert first_response.status_code == 200
+    trial = first_response.json()
+    assert trial["status"] == "TRIAL"
+    assert trial["subscription_type"] == "FREE"
+    assert date.fromisoformat(trial["trial_end"]) - date.fromisoformat(trial["trial_start"]) == timedelta(days=2)
+    assert account.subscription_id == trial["id"]
+    first_expiry = account.account_access_expires_at
+
+    second_response = client.post("/api/subscriptions/create-free", headers=subscriber_headers, json={})
+
+    assert second_response.status_code == 200
+    assert second_response.json()["id"] == trial["id"]
+    assert account.account_access_expires_at == first_expiry
+
+
+def test_subscriber_cannot_list_all_subscriptions_smoke(
+    client: TestClient,
+    fake_db: FakeSession,
+    subscriber_headers,
+):
+    own_subscription = Subscription(
+        id=1,
+        subscription_no="SUB-OWN-001",
+        user_id=42,
+        plan_id=1,
+        status="ACTIVE",
+        subscription_start=date.today(),
+    )
+    foreign_subscription = Subscription(
+        id=2,
+        subscription_no="SUB-OTHER-001",
+        user_id=99,
+        plan_id=1,
+        status="ACTIVE",
+        subscription_start=date.today(),
+    )
+    fake_db.rows_by_model[Subscription] = [own_subscription, foreign_subscription]
+
+    list_response = client.get("/api/subscriptions", headers=subscriber_headers)
+
+    assert list_response.status_code == 403
+
+
+def test_subscriber_can_fetch_own_subscription_me_smoke(
+    client: TestClient,
+    fake_db: FakeSession,
+    subscriber_headers,
+):
+    own_subscription = Subscription(
+        id=3,
+        subscription_no="SUB-ME-001",
+        user_id=42,
+        plan_id=1,
+        status="ACTIVE",
+        subscription_start=date.today(),
+    )
+    foreign_subscription = Subscription(
+        id=4,
+        subscription_no="SUB-ME-OTHER",
+        user_id=99,
+        plan_id=1,
+        status="ACTIVE",
+        subscription_start=date.today(),
+    )
+    fake_db.rows_by_model[Subscription] = [foreign_subscription, own_subscription]
+
+    response = client.get("/api/subscriptions/me", headers=subscriber_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload is not None
+    assert payload["subscription_no"] == "SUB-ME-001"
+
+
+def test_subscriber_cannot_pay_foreign_subscription_smoke(
+    client: TestClient,
+    fake_db: FakeSession,
+    subscriber_headers,
+):
+    foreign_subscription = Subscription(
+        id=50,
+        subscription_no="SUB-FOREIGN",
+        user_id=999,
+        plan_id=1,
+        status="ACTIVE",
+        subscription_start=date.today(),
+    )
+    fake_db.rows_by_model[Subscription] = [foreign_subscription]
+
+    response = client.post(
+        "/api/subscriptions/payments",
+        headers=subscriber_headers,
+        json={
+            "payment_reference": "PAY-001",
+            "subscription_id": 50,
+            "payment_status": "PENDING",
+        },
+    )
+
+    assert response.status_code == 403
+
+
+def test_subscriber_lists_only_own_subscription_payments_smoke(
+    client: TestClient,
+    fake_db: FakeSession,
+    subscriber_headers,
+):
+    own_subscription = Subscription(
+        id=51,
+        subscription_no="SUB-OWN",
+        user_id=42,
+        plan_id=1,
+        status="ACTIVE",
+        subscription_start=date.today(),
+    )
+    foreign_subscription = Subscription(
+        id=52,
+        subscription_no="SUB-FOREIGN",
+        user_id=999,
+        plan_id=1,
+        status="ACTIVE",
+        subscription_start=date.today(),
+    )
+    own_payment = SubscriptionPayment(
+        id=61,
+        payment_reference="PAY-OWN",
+        subscription_id=own_subscription.id,
+        amount=160,
+        currency="PHP",
+        payment_status="SUCCESS",
+    )
+    own_payment.subscription = own_subscription
+    foreign_payment = SubscriptionPayment(
+        id=62,
+        payment_reference="PAY-FOREIGN",
+        subscription_id=foreign_subscription.id,
+        amount=1600,
+        currency="PHP",
+        payment_status="SUCCESS",
+    )
+    foreign_payment.subscription = foreign_subscription
+    fake_db.rows_by_model[SubscriptionPayment] = [foreign_payment, own_payment]
+
+    response = client.get("/api/subscriptions/payments", headers=subscriber_headers)
+
+    assert response.status_code == 200
+    assert [payment["payment_reference"] for payment in response.json()] == ["PAY-OWN"]
+
+
+def test_admin_can_confirm_subscription_payment_smoke(
+    client: TestClient,
+    fake_db: FakeSession,
+    admin_headers,
+):
+    plan = SubscriptionPlan(
+        id=1,
+        plan_code="PRO",
+        plan_name="Pro",
+        billing_cycle="MONTHLY",
+    )
+    subscription = Subscription(
+        id=5,
+        subscription_no="SUB-PAY-001",
+        user_id=88,
+        plan_id=1,
+        status="SUSPENDED",
+        subscription_type="TRIAL",
+        subscription_start=date.today(),
+    )
+    subscription.plan = plan
+    payment = SubscriptionPayment(
+        id=6,
+        payment_reference="PAY-ADMIN-001",
+        subscription_id=5,
+        payment_status="PENDING",
+    )
+    payment.subscription = subscription
+    user = User(
+        id=88,
+        username="subscriber88",
+        email="subscriber88@example.com",
+        password_hash="hash",
+        role="subscriber",
+    )
+
+    fake_db.rows_by_model[SubscriptionPlan] = [plan]
+    fake_db.rows_by_model[Subscription] = [subscription]
+    fake_db.rows_by_model[SubscriptionPayment] = [payment]
+    fake_db.rows_by_model[User] = [user]
+
+    response = client.patch(
+        "/api/subscriptions/payments/6",
+        headers=admin_headers,
+        json={"payment_status": "SUCCESS"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["payment_status"] == "SUCCESS"
+    assert payload["paid_at"] is not None
+    assert subscription.status == "ACTIVE"
+    assert user.subscription_id == subscription.id
+
+
+def test_feature_assign_and_list_smoke(client: TestClient, fake_db: FakeSession, admin_headers):
+    plan = SubscriptionPlan(
+        id=7,
+        plan_code="PRO",
+        plan_name="Pro",
+        billing_cycle="MONTHLY",
+    )
+    feature = Feature(
+        id=8,
+        feature_code="AI_REPORTS",
+        feature_name="AI Reports",
+    )
+    fake_db.rows_by_model[SubscriptionPlan] = [plan]
+    fake_db.rows_by_model[Feature] = [feature]
+
+    assign_response = client.put(
+        "/api/subscriptions/plans/7/features",
+        headers=admin_headers,
+        json={"feature_ids": [8]},
+    )
+    assert assign_response.status_code == 200
+
+    list_response = client.get("/api/subscriptions/plans/7/features", headers=admin_headers)
+    assert list_response.status_code == 200
+    assert isinstance(list_response.json(), list)
+
+
+def test_admin_can_update_plan_amendment_fields_smoke(
+    client: TestClient,
+    fake_db: FakeSession,
+    admin_headers,
+):
+    existing_plan = SubscriptionPlan(
+        id=11,
+        plan_code="STARTER",
+        plan_name="Starter",
+        billing_cycle="MONTHLY",
+        trial_days=14,
+        support_level="STANDARD",
+        is_public=True,
+    )
+    fake_db.rows_by_model[SubscriptionPlan] = [existing_plan]
+
+    response = client.patch(
+        "/api/subscriptions/plans/11",
+        headers=admin_headers,
+        json={
+            "trial_days": 21,
+            "support_level": "PRIORITY",
+            "is_public": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["trial_days"] == 21
+    assert payload["support_level"] == "PRIORITY"
+    assert payload["is_public"] is False
+
+
+def test_subscriber_cannot_update_subscription_amendment_fields_smoke(
+    client: TestClient,
+    fake_db: FakeSession,
+    subscriber_headers,
+):
+    own_subscription = Subscription(
+        id=20,
+        subscription_no="SUB-OWN-UPDATE",
+        user_id=42,
+        plan_id=1,
+        status="ACTIVE",
+        subscription_start=date.today(),
+        subscription_type="TRIAL",
+        renewal_count=0,
+        current_users=1,
+    )
+    fake_db.rows_by_model[Subscription] = [own_subscription]
+
+    response = client.patch(
+        "/api/subscriptions/20",
+        headers=subscriber_headers,
+        json={
+            "subscription_type": "PAID",
+            "renewal_count": 3,
+            "current_users": 4,
+        },
+    )
+
+    assert response.status_code == 403
+    assert own_subscription.subscription_type == "TRIAL"
+    assert own_subscription.renewal_count == 0
+    assert own_subscription.current_users == 1
+
+
+def test_entitlement_endpoint_admin_allowed_smoke(client: TestClient, admin_headers):
+    response = client.get(
+        "/api/subscriptions/entitlement/loan-record-create",
+        headers=admin_headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["allowed"] is True
+    assert payload["reason"] == "ROLE_NOT_BILLED"
+
+
+def test_entitlement_endpoint_subscriber_no_active_subscription_smoke(
+    client: TestClient,
+    subscriber_headers,
+):
+    response = client.get(
+        "/api/subscriptions/entitlement/loan-record-create",
+        headers=subscriber_headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["allowed"] is False
+    assert payload["reason"] == "NO_ACTIVE_SUBSCRIPTION"

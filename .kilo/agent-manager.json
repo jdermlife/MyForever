@@ -1,0 +1,25 @@
+{
+  "worktrees": {
+    "wt-1778195697662-1": {
+      "branch": "paint-afterthought",
+      "path": "c:\\Users\\Jorge\\Documents\\fleet\\fms\\.kilo\\worktrees\\paint-afterthought",
+      "parentBranch": "main",
+      "createdAt": "2026-05-07T23:14:57.662Z",
+      "remote": "origin"
+    }
+  },
+  "sessions": {
+    "ses_1fb46eedbffe5tObyMS2abjTc0": {
+      "worktreeId": "wt-1778195697662-1",
+      "createdAt": "2026-05-07T23:14:58.022Z"
+    }
+  },
+  "tabOrder": {
+    "local": [
+      "pending:1"
+    ]
+  },
+  "worktreeOrder": [
+    "wt-1778195697662-1"
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "headers": [
+    {
+      "source": "/index.html",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-cache, no-store, must-revalidate"
+        }
+      ]
+    },
+    {
+      "source": "/assets/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=31536000, immutable"
+        }
+      ]
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/api/auth/login",
+      "destination": "https://filscore-ai.quantech.international/api/auth/login"
+    },
+    {
+      "source": "/api/auth/google-token",
+      "destination": "https://filscore-ai.quantech.international/api/auth/google-token"
+    },
+    {
+      "source": "/api/auth/apple-token",
+      "destination": "https://filscore-ai.quantech.international/api/auth/apple-token"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "https://filscore-ai.quantech.international/api/:path*"
+    },
+    {
+      "source": "/backend/:path*",
+      "destination": "https://filscore-ai.quantech.international/:path*"
+    },
+    {
+      "source": "/((?!assets/).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

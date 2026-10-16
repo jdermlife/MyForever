@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+try:
+    import jwt
+except ImportError:
+    jwt = None
+
+
+def _resolve_secret_key() -> str:
+    key = os.getenv("SECRET_KEY") or os.getenv("JWT_SECRET")
+    if key:
+        return key
+
+    environment = os.getenv("ENVIRONMENT", "development").lower()
+    if environment in {"development", "dev", "test", "testing"}:
+           return "dev-insecure-secret-change-me-please-override-in-production-2026"
+
+    raise RuntimeError("SECRET_KEY or JWT_SECRET must be configured")
+
+
+SECRET_KEY = _resolve_secret_key()
+TOKEN_EXPIRY_HOURS = int(os.getenv("TOKEN_EXPIRY_HOURS", "24"))
+
+
+class TokenError(Exception):
+    pass
+
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    iterations = 100_000
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=32)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    if not stored_hash or not password:
+        return False
+    
+    parts = stored_hash.split("$")
+    if len(parts) != 4 or parts[0] != "pbkdf2_sha256":
+        return False
+    
+    try:
+        iterations = int(parts[1])
+        salt = bytes.fromhex(parts[2])
+        expected = parts[3]
+        computed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=32)
+        return hmac.compare_digest(computed.hex(), expected)
+    except (ValueError, TypeError):
+        return False
+
+
+@dataclass
+class TokenPayload:
+    sub: int
+    username: str
+    role: str
+    exp: float
+    iat: float
+    auth_provider: str | None = None
+    session_jti: str | None = None
+
+
+def create_token(
+    user_id: int,
+    username: str,
+    role: str,
+    expires_in_hours: int = TOKEN_EXPIRY_HOURS,
+    auth_provider: str | None = None,
+    session_jti: str | None = None,
+) -> str:
+    if jwt is None:
+        raise RuntimeError("PyJWT is required for token creation. Install with: pip install PyJWT")
+    
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "username": username,
+        "role": role,
+        "iat": now,
+        "exp": now + timedelta(hours=expires_in_hours),
+        "jti": os.urandom(16).hex(),
+    }
+    if auth_provider:
+        payload["auth_provider"] = auth_provider
+    if session_jti:
+        payload["session_jti"] = session_jti
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+
+def decode_token(token: str) -> TokenPayload:
+    if jwt is None:
+        raise RuntimeError("PyJWT is required for token decoding. Install with: pip install PyJWT")
+    
+    try:
+        data = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return TokenPayload(
+            sub=int(data["sub"]),
+            username=data["username"],
+            role=data["role"],
+            exp=data["exp"],
+            iat=data["iat"],
+            auth_provider=data.get("auth_provider"),
+            session_jti=data.get("session_jti"),
+        )
+    except jwt.ExpiredSignatureError:
+        raise TokenError("Token has expired")
+    except jwt.InvalidTokenError:
+        raise TokenError("Invalid token")

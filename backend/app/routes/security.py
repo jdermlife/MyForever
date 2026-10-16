@@ -1,0 +1,1860 @@
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+import os
+import re
+import secrets
+from datetime import datetime, timedelta, timezone
+from typing import Literal
+from urllib.parse import parse_qs, urlencode, urlsplit
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from pydantic import BaseModel, Field
+import requests
+from sqlalchemy import and_
+from sqlalchemy.orm import Session
+
+from app.database import SessionLocal, set_rls_context
+from app.fastapi_auth import (
+    CurrentUser,
+    require_authenticated_user,
+    require_roles,
+)
+from app.models.permissions import Permission
+from app.models.roles import Role, role_permissions, user_roles
+from app.models.ai_governance import AIFeedback, AIRequest, AIResponse
+from app.models.autosave_draft import AutosaveDraft
+from app.models.loan_application import LoanApplication
+from app.models.notification import Notification, NotificationPreference
+from app.models.profile_history import ProfileHistory
+from app.models.users import AuthSession, MfaBackupCode, User
+from app.services.account_access_service import (
+    configure_new_account_access,
+    deactivate_if_access_expired,
+    get_account_access_state,
+)
+from app.services.mfa_service import (
+    build_otpauth_uri,
+    generate_backup_codes,
+    generate_totp_secret,
+    hash_backup_code,
+    verify_backup_code,
+    verify_totp,
+)
+from app.services.email_service import send_email
+from app.services.new_user_notification_service import notify_admins_of_new_user
+from app.services.security_bootstrap import seed_roles_and_permissions
+from logging_config import security_logger
+from security.rbac import ROLE_PERMISSIONS, Role as RBACRole
+from security.auth import SECRET_KEY, TokenError, create_token, decode_token, hash_password, verify_password
+
+try:
+    import jwt
+except ImportError:  # pragma: no cover - handled in runtime checks
+    jwt = None
+
+router = APIRouter(prefix="/auth", tags=["security"])
+admin_router = APIRouter(prefix="/admin", tags=["security-admin"])
+CSP_REPORT_MAX_BYTES = 16_384
+CSP_REPORT_MAX_ITEMS = 10
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    mfa_code: str | None = None
+    backup_code: str | None = None
+
+
+class TokenRefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3)
+    email: str
+    password: str = Field(min_length=8)
+    subscriber_type: Literal["borrower", "lender"]
+    lender_data_sharing_consent: bool
+    turnstile_token: str | None = Field(default=None, max_length=2048)
+
+
+class GoogleTokenLoginRequest(BaseModel):
+    id_token: str = Field(min_length=10)
+    platform: Literal["web", "ios","android"] = "web"
+    subscriber_type: Literal["borrower", "lender"] | None = None
+    lender_data_sharing_consent: bool | None = None
+
+
+class AppleTokenLoginRequest(BaseModel):
+    id_token: str = Field(min_length=10)
+    subscriber_type: Literal["borrower", "lender"] | None = None
+    lender_data_sharing_consent: bool | None = None
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+class DeleteAccountRequest(BaseModel):
+    current_password: str | None = None
+    deletion_mode: Literal["account_and_data", "data_only"] = "account_and_data"
+
+
+class PasswordResetRequest(BaseModel):
+    email_or_username: str = Field(min_length=3)
+    turnstile_token: str | None = Field(default=None, max_length=2048)
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    user_id: int
+    reset_token: str = Field(min_length=12)
+    new_password: str = Field(min_length=8)
+
+
+class UpdatePreferencesRequest(BaseModel):
+    lender_data_sharing_consent: bool
+
+
+class MfaVerifyRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=8)
+
+
+class RevokeSessionRequest(BaseModel):
+    session_id: int
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(min_length=3)
+    email: str
+    password: str = Field(min_length=8)
+    is_active: bool = True
+    account_status: str = "ACTIVE"
+    first_name: str | None = None
+    middle_name: str | None = None
+    last_name: str | None = None
+    mobile_no: str | None = None
+    role_id: int | None = None
+    subscription_id: int | None = None
+    api_access: bool = False
+    email_verified: bool = False
+    roles: list[str] = Field(default_factory=list)
+
+
+def _csp_report_origin(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    parsed = urlsplit(normalized)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"[:512]
+    return normalized[:128]
+
+
+def _csp_report_items(payload: object) -> list[dict[str, object]]:
+    candidates = payload if isinstance(payload, list) else [payload]
+    reports: list[dict[str, object]] = []
+    for candidate in candidates[:CSP_REPORT_MAX_ITEMS]:
+        if not isinstance(candidate, dict):
+            continue
+        legacy_report = candidate.get("csp-report")
+        report = legacy_report if isinstance(legacy_report, dict) else candidate.get("body", candidate)
+        if isinstance(report, dict):
+            reports.append(report)
+    return reports
+
+
+@router.post("/csp-report", status_code=status.HTTP_204_NO_CONTENT)
+async def collect_csp_report(request: Request) -> Response:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > CSP_REPORT_MAX_BYTES:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        body.extend(chunk)
+
+    if not body:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    for report in _csp_report_items(payload):
+        security_logger.warning(
+            "csp_violation_report",
+            effective_directive=str(
+                report.get("effective-directive") or report.get("effectiveDirective") or "unknown"
+            )[:128],
+            blocked_origin=_csp_report_origin(
+                report.get("blocked-uri") or report.get("blockedURL")
+            ),
+            document_origin=_csp_report_origin(
+                report.get("document-uri") or report.get("documentURL")
+            ),
+            source_origin=_csp_report_origin(
+                report.get("source-file") or report.get("sourceFile")
+            ),
+            disposition=str(report.get("disposition") or "report")[:32],
+        )
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class UpdateUserRequest(BaseModel):
+    email: str | None = None
+    is_active: bool | None = None
+    account_status: str | None = None
+    first_name: str | None = None
+    middle_name: str | None = None
+    last_name: str | None = None
+    mobile_no: str | None = None
+    role_id: int | None = None
+    subscription_id: int | None = None
+    api_access: bool | None = None
+    email_verified: bool | None = None
+
+
+class AssignRolesRequest(BaseModel):
+    roles: list[str]
+
+
+class CreateRoleRequest(BaseModel):
+    name: str = Field(min_length=2)
+    description: str | None = None
+
+
+class CreatePermissionRequest(BaseModel):
+    name: str
+    description: str | None = None
+    resource: str
+    action: str
+
+
+class AssignPermissionsRequest(BaseModel):
+    permissions: list[str]
+
+
+REFRESH_TOKEN_EXPIRY_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRY_DAYS", "30"))
+MFA_ISSUER = os.getenv("MFA_ISSUER", "QuantEdge")
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+GOOGLE_IOS_CLIENT_ID = os.getenv("GOOGLE_IOS_CLIENT_ID", "").strip()
+APPLE_OAUTH_CLIENT_ID = (
+    os.getenv("APPLE_OAUTH_CLIENT_ID", "").strip()
+    or "com.quantech.filscore.web"
+)
+APPLE_IOS_CLIENT_ID = os.getenv("APPLE_IOS_CLIENT_ID", "com.quantech.filscore").strip()
+APPLE_KEY_ID = os.getenv("APPLE_KEY_ID", "").strip()
+APPLE_TEAM_ID = os.getenv("APPLE_TEAM_ID", "").strip()
+APPLE_PRIVATE_KEY = os.getenv("APPLE_PRIVATE_KEY", "").strip()
+APPLE_REDIRECT_URI = os.getenv(
+    "APPLE_REDIRECT_URI",
+    "https://filscore-ai.quantech.international/api/auth/apple/callback",
+).strip()
+APPLE_ANDROID_REDIRECT_URI = os.getenv(
+    "APPLE_ANDROID_REDIRECT_URI",
+    "filscore://apple-callback",
+).strip()
+APPLE_TOKEN_URL = "https://appleid.apple.com/auth/token"
+APPLE_OAUTH_ISSUER = "https://appleid.apple.com"
+APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+APPLE_JWKS_CACHE_TTL_SECONDS = int(os.getenv("APPLE_JWKS_CACHE_TTL_SECONDS", "3600"))
+_APPLE_JWKS_CACHE: dict[str, object] = {"expires_at": datetime.fromtimestamp(0, timezone.utc), "keys": []}
+APPLE_CALLBACK_MAX_BODY_BYTES = 64 * 1024
+REGISTERABLE_SUBSCRIBER_ROLES = {
+    "borrower": RBACRole.SUBSCRIBER_BORROWER.value,
+    "lender": RBACRole.SUBSCRIBER_LENDER.value,
+}
+PASSWORD_RESET_TOKEN_EXPIRY_MINUTES = int(os.getenv("PASSWORD_RESET_TOKEN_EXPIRY_MINUTES", "30"))
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _record_lender_data_sharing_choice(user: User, consent: bool) -> None:
+    user.lender_data_sharing_consent = consent
+    user.lender_data_sharing_consent_recorded_at = datetime.now(timezone.utc)
+
+
+def _verify_turnstile_token(token: str | None, remote_ip: str | None) -> None:
+    secret_key = os.getenv("TURNSTILE_SECRET_KEY", "").strip()
+    is_required = os.getenv("TURNSTILE_REQUIRED", "false").lower() == "true"
+    if not secret_key:
+        if is_required:
+            raise HTTPException(status_code=503, detail="Security verification is not configured")
+        return
+    if not token:
+        raise HTTPException(status_code=400, detail="Complete the security verification before continuing")
+
+    verification_payload = {"secret": secret_key, "response": token}
+    if remote_ip:
+        verification_payload["remoteip"] = remote_ip
+    try:
+        response = requests.post(TURNSTILE_VERIFY_URL, data=verification_payload, timeout=5)
+        response.raise_for_status()
+        result = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Security verification is temporarily unavailable") from exc
+
+    if not isinstance(result, dict) or result.get("success") is not True:
+        raise HTTPException(status_code=400, detail="Security verification failed. Please try again")
+
+
+def _serialize_permission(permission: Permission) -> dict[str, object]:
+    return {
+        "id": permission.id,
+        "name": permission.name,
+        "description": permission.description,
+        "resource": permission.resource,
+        "action": permission.action,
+    }
+
+
+def _serialize_role(role: Role, *, include_permissions: bool = True) -> dict[str, object]:
+    payload = {
+        "id": role.id,
+        "name": role.name,
+        "description": role.description,
+        "is_system": role.is_system,
+    }
+    if include_permissions:
+        permissions = (
+            db_permission
+            for db_permission in role.permissions
+        ) if hasattr(role, "permissions") else []
+        payload["permissions"] = [_serialize_permission(permission) for permission in permissions]
+    return payload
+
+
+def _resolved_role_names(user: User) -> list[str]:
+    return sorted(
+        {role.name for role in user.roles}
+        | ({user.role} if user.role else set())
+        | ({user.role_ref.name} if getattr(user, "role_ref", None) and user.role_ref.name else set())
+    )
+
+
+def _effective_token_role(user: User) -> str:
+    if any(role_name.strip().lower() == "admin" for role_name in _resolved_role_names(user)):
+        return "admin"
+    return user.role
+
+
+def _fallback_permissions_for_role_names(role_names: list[str]) -> list[str]:
+    permissions = set[str]()
+
+    for role_name in role_names:
+        normalized_role_name = role_name.strip().lower()
+        if not normalized_role_name:
+            continue
+        try:
+            rbac_role = RBACRole(normalized_role_name)
+        except ValueError:
+            continue
+        permissions.update(permission.value for permission in ROLE_PERMISSIONS.get(rbac_role, []))
+
+    return sorted(permissions)
+
+
+def _user_permissions(user: User, db: Session) -> list[str]:
+    if not user.roles:
+        return _fallback_permissions_for_role_names(_resolved_role_names(user))
+    role_ids = [role.id for role in user.roles]
+    permission_rows = (
+        db.query(Permission.name)
+        .join(role_permissions, Permission.id == role_permissions.c.permission_id)
+        .filter(role_permissions.c.role_id.in_(role_ids))
+        .distinct()
+        .all()
+    )
+    db_permissions = sorted(row[0] for row in permission_rows)
+    fallback_permissions = _fallback_permissions_for_role_names(_resolved_role_names(user))
+    return sorted(set(db_permissions) | set(fallback_permissions))
+
+
+def _serialize_user(
+    user: User,
+    db: Session,
+    auth_provider: str | None = None,
+) -> dict[str, object]:
+    role_names = _resolved_role_names(user)
+
+    access_state = get_account_access_state(user)
+
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "is_active": user.is_active,
+        "is_deleted": user.is_deleted,
+        "account_status": user.account_status,
+        "first_name": user.first_name,
+        "middle_name": user.middle_name,
+        "last_name": user.last_name,
+        "mobile_no": user.mobile_no,
+        "role_id": user.role_id,
+        "subscription_id": user.subscription_id,
+        "api_access": user.api_access,
+        "email_verified": user.email_verified,
+        "has_apple_sign_in": bool(user.apple_subject),
+        "has_google_sign_in": auth_provider == "google",
+        "admin_user_notification_sent_at": user.admin_user_notification_sent_at,
+        "account_access_expires_at": user.account_access_expires_at,
+        **access_state,
+        "lender_data_sharing_consent": user.lender_data_sharing_consent,
+        "lender_data_sharing_consent_recorded_at": user.lender_data_sharing_consent_recorded_at,
+        "last_login_ip": user.last_login_ip,
+        "last_login_device": user.last_login_device,
+        "total_login_count": user.total_login_count,
+        "mfa_enabled": user.mfa_enabled,
+        "last_login_at": user.last_login_at,
+        "role": role_names[0] if role_names else user.role,
+        "roles": role_names,
+        "permissions": _user_permissions(user, db),
+        "created_at": user.created_at,
+    }
+
+
+def _create_refresh_token(
+    user: User,
+    auth_provider: str | None = None,
+) -> tuple[str, str, datetime, str]:
+    if jwt is None:
+        raise RuntimeError("PyJWT is required for refresh token creation")
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=REFRESH_TOKEN_EXPIRY_DAYS)
+    jti = uuid4().hex
+    payload = {
+        "sub": str(user.id),
+        "username": user.username,
+        "role": user.role,
+        "token_type": "refresh",
+        "iat": now,
+        "exp": expires_at,
+        "jti": jti,
+    }
+    if auth_provider:
+        payload["auth_provider"] = auth_provider
+    token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    hashed_token = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return token, hashed_token, expires_at, jti
+
+
+def _verify_refresh_token(token: str) -> dict[str, object]:
+    if jwt is None:
+        raise HTTPException(status_code=500, detail="PyJWT dependency missing")
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token") from exc
+
+    if payload.get("token_type") != "refresh":
+        raise HTTPException(status_code=401, detail="Invalid token type")
+    return payload
+
+
+def _resolve_registration_role(subscriber_type: Literal["borrower", "lender"]) -> str:
+    return REGISTERABLE_SUBSCRIBER_ROLES[subscriber_type]
+
+
+def _ensure_role_assignments(user: User, db: Session, role_names: list[str]) -> None:
+    resolved_roles = []
+    for role_name in role_names:
+        role = db.query(Role).filter(Role.name == role_name).first()
+        if role is None:
+            raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found")
+        resolved_roles.append(role)
+
+    user.roles = resolved_roles
+    if resolved_roles:
+        user.role = resolved_roles[0].name
+
+
+def _username_from_google_email(email: str) -> str:
+    local_part = email.split("@", 1)[0].strip().lower()
+    sanitized = re.sub(r"[^a-z0-9._-]", "_", local_part)
+    sanitized = sanitized.strip("._-")
+    return sanitized[:90] or "google_user"
+
+
+def _generate_unique_username(db: Session, base_username: str) -> str:
+    candidate = base_username[:100]
+    suffix = 1
+    while db.query(User.id).filter(User.username == candidate).first() is not None:
+        candidate = f"{base_username[:90]}_{suffix}"
+        suffix += 1
+    return candidate[:100]
+
+
+def _ensure_default_role(user: User, db: Session, role_name: str) -> None:
+    default_role = db.query(Role).filter(Role.name == role_name).first()
+    if default_role is None:
+        default_role = db.query(Role).filter(Role.name == RBACRole.SUBSCRIBER.value).first()
+    if default_role is None:
+        default_role = db.query(Role).filter(Role.name == "read_only_user").first()
+    if default_role:
+        user.roles = [default_role]
+        user.role = default_role.name
+
+
+def _enforce_login_access_policy(user: User, db: Session) -> None:
+    if deactivate_if_access_expired(user):
+        db.commit()
+        db.refresh(user)
+
+    if not user.is_active:
+        if (
+            user.account_status
+            and user.account_status.upper() == "SUSPENDED"
+            and user.account_access_expires_at is not None
+            and user.account_access_expires_at <= datetime.now(timezone.utc)
+        ):
+            return
+        raise HTTPException(status_code=403, detail="Account is disabled")
+
+    if user.is_deleted:
+        raise HTTPException(status_code=403, detail="Account is deleted")
+
+    if user.account_status and user.account_status.upper() != "ACTIVE":
+        raise HTTPException(status_code=403, detail=f"Account status is {user.account_status}")
+
+    if user.locked_until and user.locked_until > datetime.now(timezone.utc):
+        raise HTTPException(status_code=423, detail="Account is locked")
+
+
+def _build_login_payload(
+    user: User,
+    request: Request,
+    db: Session,
+    auth_provider: str | None = None,
+) -> dict[str, object]:
+    refresh_token, refresh_hash, refresh_exp, refresh_jti = _create_refresh_token(
+        user,
+        auth_provider=auth_provider,
+    )
+    access_token = create_token(
+        user.id,
+        user.username,
+        _effective_token_role(user),
+        auth_provider=auth_provider,
+        session_jti=refresh_jti,
+    )
+
+    session = AuthSession(
+        user_id=user.id,
+        refresh_token_hash=refresh_hash,
+        jti=refresh_jti,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("User-Agent"),
+        expires_at=refresh_exp,
+    )
+    db.add(session)
+
+    user.last_login_at = datetime.now(timezone.utc)
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    user.total_login_count = (user.total_login_count or 0) + 1
+    user.last_login_ip = request.client.host if request.client else None
+    user.last_login_device = request.headers.get("User-Agent")
+
+    db.commit()
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": _serialize_user(user, db, auth_provider),
+    }
+
+
+def _hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _generate_password_reset_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _can_send_password_reset_email() -> bool:
+    return all(
+        os.getenv(env_var, "").strip()
+        for env_var in ("SMTP_SERVER", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD")
+    )
+
+
+def _load_google_auth_dependencies():
+    try:
+        google_requests_module = importlib.import_module("google.auth.transport.requests")
+        google_id_token_module = importlib.import_module("google.oauth2.id_token")
+        return google_requests_module, google_id_token_module
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="Google Sign-In dependency is not installed") from exc
+
+
+def _load_apple_sign_in_keys() -> list[dict[str, object]]:
+    now = datetime.now(timezone.utc)
+    cached_expires_at = _APPLE_JWKS_CACHE.get("expires_at")
+    cached_keys = _APPLE_JWKS_CACHE.get("keys")
+
+    if isinstance(cached_expires_at, datetime) and cached_expires_at > now and isinstance(cached_keys, list):
+        return [item for item in cached_keys if isinstance(item, dict)]
+
+    try:
+        response = requests.get(APPLE_JWKS_URL, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail="Unable to fetch Apple Sign-In keys") from exc
+
+    keys_payload = payload.get("keys") if isinstance(payload, dict) else None
+    if not isinstance(keys_payload, list):
+        raise HTTPException(status_code=503, detail="Invalid Apple Sign-In keys response")
+
+    keys = [item for item in keys_payload if isinstance(item, dict)]
+    _APPLE_JWKS_CACHE["keys"] = keys
+    _APPLE_JWKS_CACHE["expires_at"] = now + timedelta(seconds=APPLE_JWKS_CACHE_TTL_SECONDS)
+    return keys
+
+
+def _verify_apple_id_token(id_token: str) -> dict[str, object]:
+    if jwt is None:
+        raise HTTPException(status_code=500, detail="PyJWT dependency missing")
+    accepted_audiences = [
+        audience
+        for audience in (APPLE_OAUTH_CLIENT_ID, APPLE_IOS_CLIENT_ID)
+        if audience
+    ]
+    if not accepted_audiences:
+        raise HTTPException(status_code=503, detail="Apple Sign-In is not configured")
+
+    try:
+        unverified_header = jwt.get_unverified_header(id_token)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=401, detail="Invalid Apple token header") from exc
+
+    key_id = unverified_header.get("kid")
+    algorithm = str(unverified_header.get("alg") or "")
+    if not key_id or algorithm != "RS256":
+        raise HTTPException(status_code=401, detail="Unsupported Apple token header")
+
+    keys = _load_apple_sign_in_keys()
+    matching_key = next((item for item in keys if item.get("kid") == key_id), None)
+    if matching_key is None:
+        _APPLE_JWKS_CACHE["expires_at"] = datetime.fromtimestamp(0, timezone.utc)
+        keys = _load_apple_sign_in_keys()
+        matching_key = next((item for item in keys if item.get("kid") == key_id), None)
+        if matching_key is None:
+            raise HTTPException(status_code=401, detail="Unable to validate Apple token signature")
+
+    rsa_algorithm = getattr(jwt.algorithms, "RSAAlgorithm", None)
+    if rsa_algorithm is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Apple token verification is unavailable because PyJWT crypto support is missing",
+        )
+
+    try:
+        public_key = rsa_algorithm.from_jwk(json.dumps(matching_key))
+        decoded = jwt.decode(
+            id_token,
+            public_key,
+            algorithms=["RS256"],
+            audience=accepted_audiences,
+            issuer=APPLE_OAUTH_ISSUER,
+        )
+    except jwt.ExpiredSignatureError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Apple identity token expired. Please try signing in again.",
+        ) from exc
+    except jwt.InvalidAudienceError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Apple token was issued for an unsupported client ID. "
+                "Check APPLE_OAUTH_CLIENT_ID and APPLE_IOS_CLIENT_ID."
+            ),
+        ) from exc
+    except jwt.InvalidIssuerError as exc:
+        raise HTTPException(status_code=401, detail="Invalid Apple token issuer") from exc
+    except jwt.InvalidSignatureError as exc:
+        raise HTTPException(status_code=401, detail="Invalid Apple token signature") from exc
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired Apple token") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="Unable to verify Apple identity token") from exc
+
+    if not isinstance(decoded, dict):
+        raise HTTPException(status_code=401, detail="Invalid Apple token payload")
+
+    return decoded
+
+
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+def register(payload: RegisterRequest, request: Request, db: Session = Depends(get_db)):
+    _verify_turnstile_token(payload.turnstile_token, request.client.host if request.client else None)
+    set_rls_context(db, None, "admin")
+    existing = (
+        db.query(User)
+        .filter((User.username == payload.username) | (User.email == payload.email))
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Username or email already exists")
+
+    registration_role = _resolve_registration_role(payload.subscriber_type)
+
+    user = User(
+        username=payload.username,
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        role=registration_role,
+        is_active=True,
+        account_status="ACTIVE",
+        email_verified=False,
+    )
+    _record_lender_data_sharing_choice(user, payload.lender_data_sharing_consent)
+    configure_new_account_access(user)
+    db.add(user)
+    db.flush()
+
+    default_role = db.query(Role).filter(Role.name == registration_role).first()
+    if default_role is None:
+        default_role = db.query(Role).filter(Role.name == RBACRole.SUBSCRIBER.value).first()
+    if default_role is None:
+        default_role = db.query(Role).filter(Role.name == "read_only_user").first()
+    if default_role:
+        user.roles = [default_role]
+        user.role = default_role.name
+
+    db.commit()
+    db.refresh(user)
+    notify_admins_of_new_user(user, db)
+    return _build_login_payload(user, request, db, auth_provider="apple")
+
+
+@router.post("/login")
+def login(
+    payload: LoginRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    set_rls_context(db, None, "admin")
+    user = (
+        db.query(User)
+        .filter((User.username == payload.username) | (User.email == payload.username))
+        .first()
+    )
+
+    if user is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Account not found. Continue to registration.",
+        )
+
+    if not verify_password(payload.password, user.password_hash):
+        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+        user.last_failed_login = datetime.now(timezone.utc)
+        if user.failed_login_attempts >= int(os.getenv("MAX_FAILED_LOGINS", "5")):
+            user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    _enforce_login_access_policy(user, db)
+
+    if user.mfa_enabled:
+        mfa_ok = False
+        if payload.mfa_code and user.mfa_secret:
+            mfa_ok = verify_totp(user.mfa_secret, payload.mfa_code)
+
+        if not mfa_ok and payload.backup_code:
+            active_codes = [code for code in user.mfa_backup_codes if code.used_at is None]
+            match = verify_backup_code(payload.backup_code, [code.code_hash for code in active_codes])
+            if match:
+                code_row = next(code for code in active_codes if code.code_hash == match)
+                code_row.used_at = datetime.now(timezone.utc)
+                mfa_ok = True
+
+        if not mfa_ok:
+            raise HTTPException(status_code=401, detail="MFA required or invalid MFA code")
+
+    return _build_login_payload(user, request, db)
+
+
+@router.post("/google-token")
+def login_with_google_token(
+    payload: GoogleTokenLoginRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    set_rls_context(db, None, "admin")
+    google_requests, google_id_token = _load_google_auth_dependencies()
+
+    if payload.platform == "ios":
+        if not GOOGLE_IOS_CLIENT_ID:
+            raise HTTPException(
+                status_code=503,
+                detail="Google iOS Sign-In is not configured",
+            )
+
+        try:
+            token_data = google_id_token.verify_oauth2_token(
+                payload.id_token,
+                google_requests.Request(),
+                GOOGLE_IOS_CLIENT_ID,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print("GOOGLE IOS TOKEN VERIFICATION FAILED:", repr(exc))
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid Google iOS token",
+            ) from exc
+
+    else:
+        if not GOOGLE_OAUTH_CLIENT_ID:
+            raise HTTPException(
+                status_code=503,
+                detail="Google Web Sign-In is not configured",
+            )
+
+        try:
+            token_data = google_id_token.verify_oauth2_token(
+                payload.id_token,
+                google_requests.Request(),
+                GOOGLE_OAUTH_CLIENT_ID,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print("GOOGLE WEB TOKEN VERIFICATION FAILED:", repr(exc))
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid Google web token",
+            ) from exc
+
+    email = str(token_data.get("email") or "").strip().lower()
+    email_verified = bool(token_data.get("email_verified"))
+    print("GOOGLE_OAUTH_CLIENT_ID:", GOOGLE_OAUTH_CLIENT_ID)
+    print("GOOGLE_IOS_CLIENT_ID:", GOOGLE_IOS_CLIENT_ID)
+
+    if not email or not email_verified:
+        raise HTTPException(status_code=401, detail="Google account email is missing or unverified")
+
+    user = db.query(User).filter(User.email == email).first()
+
+    if user is None:
+        if payload.subscriber_type is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Select borrower or lender for first-time Google sign-in",
+            )
+        if payload.lender_data_sharing_consent is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Select data-sharing preference for first-time Google sign-in",
+            )
+
+        role_key = payload.subscriber_type
+        role_name = _resolve_registration_role(role_key)
+        requested_username = _username_from_google_email(email)
+        unique_username = _generate_unique_username(db, requested_username)
+
+        user = User(
+            username=unique_username,
+            email=email,
+            password_hash=hash_password(f"google_oauth_{uuid4().hex}"),
+            role=role_name,
+            is_active=True,
+            account_status="ACTIVE",
+            email_verified=True,
+            email_verified_at=datetime.now(timezone.utc),
+        )
+        _record_lender_data_sharing_choice(user, payload.lender_data_sharing_consent)
+        configure_new_account_access(user)
+        db.add(user)
+        db.flush()
+        _ensure_default_role(user, db, role_name)
+        db.commit()
+        db.refresh(user)
+        notify_admins_of_new_user(user, db)
+
+    _enforce_login_access_policy(user, db)
+
+    if not user.email_verified:
+        user.email_verified = True
+        user.email_verified_at = user.email_verified_at or datetime.now(timezone.utc)
+
+    return _build_login_payload(user, request, db, auth_provider="google")
+
+
+@router.post("/apple-token")
+def login_with_apple_token(
+    payload: AppleTokenLoginRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    set_rls_context(db, None, "admin")
+    token_data = _verify_apple_id_token(payload.id_token)
+
+    return _login_with_apple_claims(token_data, payload, request, db)
+
+
+def _login_with_apple_claims(
+    token_data: dict[str, object],
+    payload: AppleTokenLoginRequest,
+    request: Request,
+    db: Session,
+):
+    subject = str(token_data.get("sub") or "").strip()
+    if not subject:
+        raise HTTPException(status_code=401, detail="Invalid Apple token subject")
+
+    email = str(token_data.get("email") or "").strip().lower()
+    email_verified_claim = token_data.get("email_verified")
+    email_verified = email_verified_claim in {True, "true", "1", 1}
+
+    user = db.query(User).filter(User.apple_subject == subject).first()
+
+    if user is None and not email:
+        raise HTTPException(
+            status_code=400,
+            detail="Apple account email is required on first sign-in.",
+        )
+
+    if user is None and not email_verified:
+        raise HTTPException(status_code=401, detail="Apple account email is missing or unverified")
+
+    if user is None:
+        user = db.query(User).filter(User.email == email).first()
+        if user is not None:
+            if user.apple_subject and user.apple_subject != subject:
+                raise HTTPException(status_code=409, detail="Apple account is linked to another user")
+            user.apple_subject = subject
+
+    if user is None:
+        if payload.subscriber_type is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Select borrower or lender for first-time Apple sign-in",
+            )
+        if payload.lender_data_sharing_consent is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Select data-sharing preference for first-time Apple sign-in",
+            )
+
+        role_name = _resolve_registration_role(payload.subscriber_type)
+        requested_username = _username_from_google_email(email)
+        unique_username = _generate_unique_username(db, requested_username)
+
+        user = User(
+            username=unique_username,
+            email=email,
+            apple_subject=subject,
+            password_hash=hash_password(f"apple_oauth_{uuid4().hex}"),
+            role=role_name,
+            is_active=True,
+            account_status="ACTIVE",
+            email_verified=True,
+            email_verified_at=datetime.now(timezone.utc),
+        )
+        _record_lender_data_sharing_choice(user, payload.lender_data_sharing_consent)
+        configure_new_account_access(user)
+        db.add(user)
+        db.flush()
+        _ensure_default_role(user, db, role_name)
+        db.commit()
+        db.refresh(user)
+        notify_admins_of_new_user(user, db)
+
+    if email and user.email.lower() != email:
+        raise HTTPException(status_code=409, detail="Apple identity does not match this user")
+
+    _enforce_login_access_policy(user, db)
+
+    if not user.email_verified:
+        user.email_verified = True
+        user.email_verified_at = user.email_verified_at or datetime.now(timezone.utc)
+
+    db.commit()
+    return _build_login_payload(user, request, db, auth_provider="apple")
+
+
+def _apple_callback_page(message: str) -> HTMLResponse:
+    content = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Apple Sign-In</title>
+  </head>
+  <body>
+    <main>
+      <h1>Apple Sign-In</h1>
+      <p>{message}</p>
+      <p>You may close this window.</p>
+    </main>
+  </body>
+</html>"""
+    return HTMLResponse(
+        content=content,
+        headers={
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        },
+    )
+def _create_apple_client_secret() -> str:
+    if not APPLE_KEY_ID or not APPLE_TEAM_ID or not APPLE_PRIVATE_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Apple Sign-In server credentials are not configured",
+        )
+
+    private_key = APPLE_PRIVATE_KEY.replace("\\n", "\n")
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "iss": APPLE_TEAM_ID,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=180)).timestamp()),
+        "aud": APPLE_OAUTH_ISSUER,
+        "sub": APPLE_OAUTH_CLIENT_ID,
+    }
+
+    try:
+        return jwt.encode(
+            payload,
+            private_key,
+            algorithm="ES256",
+            headers={
+                "kid": APPLE_KEY_ID,
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create Apple client secret",
+        ) from exc
+
+@router.get("/apple/callback", response_class=HTMLResponse, include_in_schema=False)
+def apple_sign_in_callback_status() -> HTMLResponse:
+    return _apple_callback_page("The Apple Sign-In callback is ready to receive Apple's response.")
+
+
+@router.post("/apple/callback", include_in_schema=False)
+async def apple_sign_in_callback(request: Request):
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
+    if content_type != "application/x-www-form-urlencoded":
+        raise HTTPException(
+            status_code=415,
+            detail="Apple callback requires form-encoded data",
+        )
+
+    content_length = request.headers.get("content-length")
+    if (
+        content_length
+        and content_length.isdigit()
+        and int(content_length) > APPLE_CALLBACK_MAX_BODY_BYTES
+    ):
+        raise HTTPException(
+            status_code=413,
+            detail="Apple callback payload is too large",
+        )
+
+    body = await request.body()
+
+    if len(body) > APPLE_CALLBACK_MAX_BODY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Apple callback payload is too large",
+        )
+
+    try:
+        fields = parse_qs(
+            body.decode("utf-8"),
+            keep_blank_values=True,
+        )
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Apple callback encoding",
+        ) from exc
+
+    apple_error = fields.get("error", [""])[0]
+    if apple_error:
+        return RedirectResponse(
+            url=f"{APPLE_ANDROID_REDIRECT_URI}?success=false",
+            status_code=303,
+        )
+
+    code = fields.get("code", [""])[0]
+
+    if not code:
+        raise HTTPException(
+            status_code=400,
+            detail="Apple callback response is missing authorization code",
+        )
+
+    client_secret = _create_apple_client_secret()
+
+    token_payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": APPLE_REDIRECT_URI,
+        "client_id": APPLE_OAUTH_CLIENT_ID,
+        "client_secret": client_secret,
+    }
+
+    try:
+        apple_response = requests.post(
+            APPLE_TOKEN_URL,
+            data=token_payload,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to contact Apple Sign-In",
+        ) from exc
+
+    if not apple_response.ok:
+        raise HTTPException(
+            status_code=401,
+            detail="Apple authorization code exchange failed",
+        )
+
+    try:
+        apple_data = apple_response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Apple returned an invalid token response",
+        ) from exc
+
+    id_token = str(apple_data.get("id_token") or "").strip()
+    access_token = str(apple_data.get("access_token") or "").strip()
+    refresh_token = str(apple_data.get("refresh_token") or "").strip()
+
+    if not id_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Apple did not return an identity token",
+        )
+
+    # Validate the Apple identity token before sending it back to the app.
+    _verify_apple_id_token(id_token)
+
+    redirect_params = {
+        "success": "true",
+        "id_token": id_token,
+    }
+
+    if access_token:
+        redirect_params["access_token"] = access_token
+
+    if refresh_token:
+        redirect_params["refresh_token"] = refresh_token
+
+    redirect_url = (
+        f"{APPLE_ANDROID_REDIRECT_URI}?"
+        + urlencode(redirect_params)
+    )
+
+    return RedirectResponse(
+        url=redirect_url,
+        status_code=303,
+    )
+
+
+@router.post("/refresh")
+def refresh_tokens(payload: TokenRefreshRequest, db: Session = Depends(get_db)):
+    set_rls_context(db, None, "admin")
+    token_payload = _verify_refresh_token(payload.refresh_token)
+    refresh_hash = hashlib.sha256(payload.refresh_token.encode("utf-8")).hexdigest()
+
+    session = (
+        db.query(AuthSession)
+        .filter(
+            and_(
+                AuthSession.refresh_token_hash == refresh_hash,
+                AuthSession.revoked_at.is_(None),
+                AuthSession.expires_at > datetime.now(timezone.utc),
+            )
+        )
+        .first()
+    )
+
+    if session is None:
+        raise HTTPException(status_code=401, detail="Refresh session is invalid or revoked")
+
+    user = db.query(User).filter(User.id == int(token_payload["sub"])).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User is not active")
+
+    _enforce_login_access_policy(user, db)
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="User is not active")
+
+    session.revoked_at = datetime.now(timezone.utc)
+
+    auth_provider = token_payload.get("auth_provider")
+    if auth_provider not in {"apple", "google"}:
+        auth_provider = None
+    refresh_token, new_hash, new_exp, new_jti = _create_refresh_token(
+        user,
+        auth_provider=auth_provider,
+    )
+    access_token = create_token(
+        user.id,
+        user.username,
+        _effective_token_role(user),
+        auth_provider=auth_provider,
+        session_jti=new_jti,
+    )
+    db.add(
+        AuthSession(
+            user_id=user.id,
+            refresh_token_hash=new_hash,
+            jti=new_jti,
+            ip_address=session.ip_address,
+            user_agent=session.user_agent,
+            expires_at=new_exp,
+        )
+    )
+    db.commit()
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+
+@router.post("/logout")
+def logout(
+    payload: TokenRefreshRequest,
+    _: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    refresh_hash = hashlib.sha256(payload.refresh_token.encode("utf-8")).hexdigest()
+    session = db.query(AuthSession).filter(AuthSession.refresh_token_hash == refresh_hash).first()
+    if session and session.revoked_at is None:
+        session.revoked_at = datetime.now(timezone.utc)
+        db.commit()
+    return {"message": "Logged out"}
+
+
+@router.get("/me")
+def get_me(user: CurrentUser = Depends(require_authenticated_user), db: Session = Depends(get_db)):
+    set_rls_context(db, user.id, user.role)
+    db_user = db.query(User).filter(User.id == user.id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user": _serialize_user(db_user, db, user.auth_provider)}
+
+
+@router.patch("/preferences")
+def update_preferences(
+    payload: UpdatePreferencesRequest,
+    user: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    set_rls_context(db, user.id, user.role)
+    db_user = db.query(User).filter(User.id == user.id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    _record_lender_data_sharing_choice(db_user, payload.lender_data_sharing_consent)
+    db.commit()
+    db.refresh(db_user)
+
+    return {
+        "message": "Preferences updated",
+        "user": _serialize_user(db_user, db),
+    }
+
+
+@router.post("/password-reset-request")
+def request_password_reset(payload: PasswordResetRequest, request: Request, db: Session = Depends(get_db)):
+    _verify_turnstile_token(payload.turnstile_token, request.client.host if request.client else None)
+    normalized_identifier = payload.email_or_username.strip().lower()
+    if not normalized_identifier:
+        raise HTTPException(status_code=400, detail="Username or email is required")
+
+    user = (
+        db.query(User)
+        .filter((User.username == normalized_identifier) | (User.email == normalized_identifier))
+        .first()
+    )
+
+    if user is None:
+        user = (
+            db.query(User)
+            .filter((User.username == payload.email_or_username.strip()) | (User.email == payload.email_or_username.strip()))
+            .first()
+        )
+
+    response_payload: dict[str, object] = {
+        "message": "If the account exists, a password reset token has been issued.",
+    }
+
+    if user is None or user.is_deleted:
+        return response_payload
+
+    reset_token = _generate_password_reset_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_RESET_TOKEN_EXPIRY_MINUTES)
+    user.password_reset_token = _hash_reset_token(reset_token)
+    user.password_reset_token_expires = expires_at
+    db.commit()
+
+    reset_email_sent = False
+    if _can_send_password_reset_email():
+        try:
+            reset_email_body = "\n".join(
+                (
+                    "Use this password reset token to update your FMS account password.",
+                    "",
+                    f"User ID: {user.id}",
+                    f"Reset token: {reset_token}",
+                    f"Expires at: {expires_at.isoformat()}",
+                    "",
+                )
+            )
+            send_email(
+                user.email,
+                "FMS password reset",
+                reset_email_body,
+            )
+            reset_email_sent = True
+        except Exception:
+            reset_email_sent = False
+
+    if os.getenv("ENVIRONMENT", "development").lower() != "production":
+        response_payload["reset_token"] = reset_token
+        response_payload["user_id"] = user.id
+        if not reset_email_sent:
+            response_payload["message"] = (
+                "Password reset token created for development use."
+            )
+
+    return response_payload
+
+
+@router.post("/password-reset-confirm")
+def confirm_password_reset(payload: PasswordResetConfirmRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == payload.user_id).first()
+    if user is None or user.is_deleted:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not user.password_reset_token or not user.password_reset_token_expires:
+        raise HTTPException(status_code=400, detail="Password reset token is missing or has already been used")
+
+    expires_at = user.password_reset_token_expires
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    if expires_at < datetime.now(timezone.utc):
+        user.password_reset_token = None
+        user.password_reset_token_expires = None
+        db.commit()
+        raise HTTPException(status_code=400, detail="Password reset token has expired")
+
+    if not secrets.compare_digest(user.password_reset_token, _hash_reset_token(payload.reset_token)):
+        raise HTTPException(status_code=401, detail="Password reset token is invalid")
+
+    now = datetime.now(timezone.utc)
+    user.password_hash = hash_password(payload.new_password)
+    user.password_changed_at = now
+    user.password_reset_token = None
+    user.password_reset_token_expires = None
+    user.failed_login_attempts = 0
+    user.locked_until = None
+
+    for session in user.sessions:
+        if session.revoked_at is None:
+            session.revoked_at = now
+
+    db.commit()
+    return {"message": "Password reset successfully"}
+
+
+@router.post("/password/change")
+def change_password(
+    payload: ChangePasswordRequest,
+    user: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    db_user = db.query(User).filter(User.id == user.id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not verify_password(payload.current_password, db_user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    db_user.password_hash = hash_password(payload.new_password)
+    db_user.password_changed_at = datetime.now(timezone.utc)
+    for session in db_user.sessions:
+        if session.revoked_at is None:
+            session.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"message": "Password changed"}
+
+
+@router.post("/delete-account")
+def delete_account(
+    payload: DeleteAccountRequest,
+    user: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    db_user = db.query(User).filter(User.id == user.id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    is_social_account = bool(db_user.apple_subject or user.auth_provider == "google")
+    if not is_social_account and (
+        not payload.current_password or not verify_password(payload.current_password, db_user.password_hash)
+    ):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    owned_records = (
+        (AIFeedback, AIFeedback.user_id),
+        (AIResponse, AIResponse.user_id),
+        (AIRequest, AIRequest.user_id),
+        (Notification, Notification.user_id),
+        (NotificationPreference, NotificationPreference.user_id),
+        (ProfileHistory, ProfileHistory.owner_id),
+        (AutosaveDraft, AutosaveDraft.owner_id),
+        (LoanApplication, LoanApplication.created_by),
+    )
+    for model, owner_column in owned_records:
+        for record in db.query(model).filter(owner_column == db_user.id).all():
+            db.delete(record)
+
+    if payload.deletion_mode == "data_only":
+        db_user.first_name = None
+        db_user.middle_name = None
+        db_user.last_name = None
+        db_user.mobile_no = None
+        db_user.profile_photo = None
+        db_user.lender_data_sharing_consent = False
+        db_user.lender_data_sharing_consent_recorded_at = None
+        db.commit()
+        return {"message": "Associated account data deleted successfully"}
+
+    now = datetime.now(timezone.utc)
+    db_user.is_active = False
+    db_user.is_deleted = True
+    db_user.account_status = "DELETED"
+    db_user.deleted_at = now
+    db_user.deleted_by = db_user.id
+
+    for session in db_user.sessions:
+        if session.revoked_at is None:
+            session.revoked_at = now
+
+    db.commit()
+    return {"message": "Account disabled successfully"}
+
+
+@router.post("/mfa/setup")
+def setup_mfa(
+    user: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    db_user = db.query(User).filter(User.id == user.id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    secret = generate_totp_secret()
+    db_user.mfa_secret = secret
+    db_user.mfa_enabled = False
+
+    db.query(MfaBackupCode).filter(MfaBackupCode.user_id == db_user.id).delete()
+    backup_codes = generate_backup_codes()
+    for code in backup_codes:
+        db.add(MfaBackupCode(user_id=db_user.id, code_hash=hash_backup_code(code)))
+
+    db.commit()
+
+    return {
+        "secret": secret,
+        "otpauth_uri": build_otpauth_uri(secret, db_user.username, issuer=MFA_ISSUER),
+        "backup_codes": backup_codes,
+    }
+
+
+@router.post("/mfa/verify")
+def verify_mfa_setup(
+    payload: MfaVerifyRequest,
+    user: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    db_user = db.query(User).filter(User.id == user.id).first()
+    if db_user is None or not db_user.mfa_secret:
+        raise HTTPException(status_code=400, detail="MFA setup has not been initialized")
+
+    if not verify_totp(db_user.mfa_secret, payload.code):
+        raise HTTPException(status_code=401, detail="Invalid MFA code")
+
+    db_user.mfa_enabled = True
+    db.commit()
+    return {"message": "MFA enabled"}
+
+
+@router.post("/mfa/disable")
+def disable_mfa(
+    payload: MfaVerifyRequest,
+    user: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    db_user = db.query(User).filter(User.id == user.id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if db_user.mfa_enabled and db_user.mfa_secret and not verify_totp(db_user.mfa_secret, payload.code):
+        raise HTTPException(status_code=401, detail="Invalid MFA code")
+
+    db_user.mfa_enabled = False
+    db_user.mfa_secret = None
+    db.query(MfaBackupCode).filter(MfaBackupCode.user_id == db_user.id).delete()
+    db.commit()
+    return {"message": "MFA disabled"}
+
+
+@router.get("/sessions")
+def list_sessions(
+    user: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    sessions = (
+        db.query(AuthSession)
+        .filter(AuthSession.user_id == user.id)
+        .order_by(AuthSession.created_at.desc())
+        .all()
+    )
+    return {
+        "sessions": [
+            {
+                "id": session.id,
+                "auth_provider": session.auth_provider,
+                "ip_address": session.ip_address,
+                "user_agent": session.user_agent,
+                "created_at": session.created_at,
+                "last_seen_at": session.last_seen_at,
+                "expires_at": session.expires_at,
+                "revoked_at": session.revoked_at,
+            }
+            for session in sessions
+        ]
+    }
+
+
+@router.post("/sessions/revoke")
+def revoke_session(
+    payload: RevokeSessionRequest,
+    user: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    session = (
+        db.query(AuthSession)
+        .filter(and_(AuthSession.id == payload.session_id, AuthSession.user_id == user.id))
+        .first()
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"message": "Session revoked"}
+
+
+@router.delete("/providers/{provider}")
+def disconnect_sign_in_provider(
+    provider: Literal["apple", "google"],
+    user: CurrentUser = Depends(require_authenticated_user),
+    db: Session = Depends(get_db),
+):
+    db_user = db.query(User).filter(User.id == user.id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user.auth_provider != provider:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This session is not signed in with {provider.title()}",
+        )
+
+    now = datetime.now(timezone.utc)
+    sessions = (
+        db.query(AuthSession)
+        .filter(
+            and_(
+                AuthSession.user_id == db_user.id,
+                AuthSession.revoked_at.is_(None),
+            )
+        )
+        .all()
+    )
+    for session in sessions:
+        session.revoked_at = now
+
+    if provider == "apple":
+        db_user.apple_subject = None
+
+    db.commit()
+    return {
+        "message": f"{provider.title()} Sign-In disconnected",
+        "sign_out_required": True,
+    }
+
+
+@admin_router.get("/users")
+def admin_list_users(
+    current_user: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    set_rls_context(db, current_user.id, current_user.role)
+    users = db.query(User).order_by(User.created_at.desc()).all()
+    return {"users": [_serialize_user(user, db) for user in users]}
+
+
+@admin_router.post("/users", status_code=status.HTTP_201_CREATED)
+def admin_create_user(
+    payload: CreateUserRequest,
+    current_user: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    set_rls_context(db, current_user.id, current_user.role)
+    existing = (
+        db.query(User)
+        .filter((User.username == payload.username) | (User.email == payload.email))
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Username or email already exists")
+
+    user = User(
+        username=payload.username,
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        is_active=payload.is_active,
+        account_status=payload.account_status,
+        first_name=payload.first_name,
+        middle_name=payload.middle_name,
+        last_name=payload.last_name,
+        mobile_no=payload.mobile_no,
+        role_id=payload.role_id,
+        subscription_id=payload.subscription_id,
+        api_access=payload.api_access,
+        email_verified=payload.email_verified,
+        role="read_only_user",
+    )
+    db.add(user)
+    db.flush()
+
+    if payload.role_id is not None:
+        db_role = db.query(Role).filter(Role.id == payload.role_id).first()
+        if db_role is None:
+            raise HTTPException(status_code=404, detail="Role not found")
+        user.role = db_role.name
+
+    if payload.roles:
+        _ensure_role_assignments(user, db, payload.roles)
+
+    db.commit()
+    db.refresh(user)
+    notify_admins_of_new_user(user, db)
+    return {"user": _serialize_user(user, db)}
+
+
+@admin_router.patch("/users/{user_id}")
+def admin_update_user(
+    user_id: int,
+    payload: UpdateUserRequest,
+    current_user: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    set_rls_context(db, current_user.id, current_user.role)
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if payload.email is not None:
+        user.email = payload.email
+    if payload.is_active is not None:
+        user.is_active = payload.is_active
+    if payload.account_status is not None:
+        user.account_status = payload.account_status
+    if payload.first_name is not None:
+        user.first_name = payload.first_name
+    if payload.middle_name is not None:
+        user.middle_name = payload.middle_name
+    if payload.last_name is not None:
+        user.last_name = payload.last_name
+    if payload.mobile_no is not None:
+        user.mobile_no = payload.mobile_no
+    if payload.role_id is not None:
+        db_role = db.query(Role).filter(Role.id == payload.role_id).first()
+        if db_role is None:
+            raise HTTPException(status_code=404, detail="Role not found")
+        user.role_id = payload.role_id
+        user.role = db_role.name
+    if "subscription_id" in payload.model_fields_set:
+        user.subscription_id = payload.subscription_id
+    if payload.api_access is not None:
+        user.api_access = payload.api_access
+    if payload.email_verified is not None:
+        user.email_verified = payload.email_verified
+
+    db.commit()
+    db.refresh(user)
+    return {"user": _serialize_user(user, db)}
+
+
+@admin_router.put("/users/{user_id}/roles")
+def admin_assign_roles(
+    user_id: int,
+    payload: AssignRolesRequest,
+    current_user: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    set_rls_context(db, current_user.id, current_user.role)
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    _ensure_role_assignments(user, db, payload.roles)
+    db.commit()
+    db.refresh(user)
+    return {"user": _serialize_user(user, db)}
+
+
+@admin_router.get("/roles")
+def admin_list_roles(
+    _: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    roles = db.query(Role).order_by(Role.name.asc()).all()
+    result = []
+    for role in roles:
+        permissions = (
+            db.query(Permission)
+            .join(role_permissions, Permission.id == role_permissions.c.permission_id)
+            .filter(role_permissions.c.role_id == role.id)
+            .all()
+        )
+        result.append(
+            {
+                "id": role.id,
+                "name": role.name,
+                "description": role.description,
+                "is_system": role.is_system,
+                "permissions": [_serialize_permission(permission) for permission in permissions],
+            }
+        )
+    return {"roles": result}
+
+
+@admin_router.post("/roles", status_code=status.HTTP_201_CREATED)
+def admin_create_role(
+    payload: CreateRoleRequest,
+    _: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    existing = db.query(Role).filter(Role.name == payload.name).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Role already exists")
+
+    role = Role(name=payload.name, description=payload.description, is_system=False)
+    db.add(role)
+    db.commit()
+    db.refresh(role)
+    return {"role": {"id": role.id, "name": role.name, "description": role.description}}
+
+
+@admin_router.put("/roles/{role_id}/permissions")
+def admin_assign_permissions(
+    role_id: int,
+    payload: AssignPermissionsRequest,
+    _: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if role is None:
+        raise HTTPException(status_code=404, detail="Role not found")
+
+    permissions = db.query(Permission).filter(Permission.name.in_(payload.permissions)).all()
+    resolved = {permission.name: permission for permission in permissions}
+
+    missing = [name for name in payload.permissions if name not in resolved]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Permissions not found: {', '.join(missing)}")
+
+    db.execute(role_permissions.delete().where(role_permissions.c.role_id == role.id))
+    for permission in permissions:
+        db.execute(
+            role_permissions.insert().values(
+                role_id=role.id,
+                permission_id=permission.id,
+            )
+        )
+
+    db.commit()
+    return {"message": "Permissions assigned"}
+
+
+@admin_router.get("/permissions")
+def admin_list_permissions(
+    _: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    permissions = db.query(Permission).order_by(Permission.name.asc()).all()
+    return {"permissions": [_serialize_permission(permission) for permission in permissions]}
+
+
+@admin_router.post("/permissions", status_code=status.HTTP_201_CREATED)
+def admin_create_permission(
+    payload: CreatePermissionRequest,
+    _: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    existing = db.query(Permission).filter(Permission.name == payload.name).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Permission already exists")
+
+    permission = Permission(
+        name=payload.name,
+        description=payload.description,
+        resource=payload.resource,
+        action=payload.action,
+    )
+    db.add(permission)
+    db.commit()
+    db.refresh(permission)
+    return {"permission": _serialize_permission(permission)}
+
+
+@admin_router.post("/security/bootstrap")
+def bootstrap_security(
+    _: CurrentUser = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    seed_roles_and_permissions(db)
+    return {"message": "Security roles and permissions synchronized"}

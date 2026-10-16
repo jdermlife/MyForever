@@ -1,0 +1,211 @@
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const { mockFetchAutosaveDraft } = vi.hoisted(() => ({
+  mockFetchAutosaveDraft: vi.fn(),
+}))
+
+vi.mock('../src/autosave/draftApi', () => ({
+  fetchAutosaveDraft: mockFetchAutosaveDraft,
+}))
+
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom')
+  return {
+    ...actual,
+    Link: ({ to, children }: { to: string; children?: React.ReactNode }) => <a href={to}>{children}</a>,
+  }
+})
+
+vi.mock('../src/components/profile/SelectedProfileIdCard', () => ({
+  default: () => <article>Record ID</article>,
+}))
+
+import FinancialDecisions from '../src/pages/scoring/FinancialDecisions'
+
+describe('FinancialDecisions', () => {
+  beforeEach(() => {
+    mockFetchAutosaveDraft.mockReset()
+    mockFetchAutosaveDraft.mockResolvedValue(null)
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  it('renders the financial snapshot and seven decision categories', () => {
+    render(<FinancialDecisions />)
+
+    expect(screen.getByRole('heading', { name: 'Financial Decisions' })).toBeTruthy()
+    const journeyMenu = screen.getByText('Financial Health Journey Menu').closest('details')
+    expect(journeyMenu).toBeTruthy()
+    expect(journeyMenu?.closest('.financial-decisions-header')).toBeTruthy()
+    expect(within(journeyMenu as HTMLElement).getByRole('link', { name: /Financial Health Journey/ })).toBeTruthy()
+    const decisionsLink = within(journeyMenu as HTMLElement).getByRole('link', { name: 'Financial Decisions & Action Plan' })
+    const reportsLink = within(journeyMenu as HTMLElement).getByRole('link', { name: 'Reports & Statements' })
+    expect(reportsLink.getAttribute('href')).toBe('/reports-statements')
+    expect(decisionsLink.nextElementSibling).toBe(reportsLink)
+    expect(screen.getByRole('heading', { name: 'Your Financial Snapshot' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'What are you deciding today?' })).toBeTruthy()
+    expect(document.querySelectorAll('.decision-card')).toHaveLength(7)
+    expect(screen.getByText('Hypothetical data in use')).toBeTruthy()
+  })
+
+  it('shows the affordability workspace and recalculates a hard-stop recommendation', () => {
+    render(<FinancialDecisions />)
+
+    const result = screen.getByRole('region', { name: 'Affordability result' })
+    expect(within(result).getByText(/\/100$/).textContent).toMatch(/^\d+\/100$/)
+
+    fireEvent.change(screen.getByLabelText('Net Monthly Income'), { target: { value: '30000' } })
+
+    expect(within(result).getByText('Not recommended')).toBeTruthy()
+    expect(screen.getAllByText('Action required').length).toBeGreaterThan(0)
+  })
+
+  it('opens savings optimization and recalculates the goal timeline', async () => {
+    render(<FinancialDecisions />)
+
+    await userEvent.click(screen.getByRole('button', { name: /How much should I save?/ }))
+    const result = screen.getByRole('region', { name: 'Savings optimization result' })
+
+    expect(within(result).getByText('₱33,333')).toBeTruthy()
+    expect(within(result).getByText('20 months')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('Current Monthly Savings'), { target: { value: '40000' } })
+
+    expect(within(result).getByText('10 months')).toBeTruthy()
+    expect(within(result).getByText('On track')).toBeTruthy()
+  })
+
+  it('links the Debt Strategy card to its hover and focus guidance', () => {
+    render(<FinancialDecisions />)
+
+    const debtCard = screen.getByRole('button', { name: /Pay debt or invest?/ })
+    const guide = screen.getByLabelText('Debt strategy practical guidelines')
+
+    expect(debtCard.getAttribute('aria-describedby')).toBe('debt-strategy-popout')
+    expect(within(guide).getByText('Rule of thumb: Kill expensive debt first, invest early when debt is cheap.')).toBeTruthy()
+    expect(within(guide).getByText(/20% APR credit card/)).toBeTruthy()
+    expect(within(guide).getByText('Extra cash: 70% debt payoff, 30% investing.')).toBeTruthy()
+  })
+
+  it('links the Capital Allocation card to its starter strategy popout', () => {
+    render(<FinancialDecisions />)
+
+    const capitalCard = screen.getByRole('button', { name: /Where should I invest?/ })
+    const guide = screen.getByLabelText('Capital allocation practical starter strategy')
+
+    expect(capitalCard.getAttribute('aria-describedby')).toBe('capital-allocation-popout')
+    expect(within(guide).getByText('✅ Practical Starter Strategy')).toBeTruthy()
+    expect(within(guide).getByText('Emergency fund first (cash savings).')).toBeTruthy()
+    expect(within(guide).getByText(/Low-cost index funds or ETFs/)).toBeTruthy()
+    expect(within(guide).getByText('Avoid speculative bets until your portfolio is stable.')).toBeTruthy()
+  })
+
+  it('routes a plain-language question to the matching decision workspace', async () => {
+    render(<FinancialDecisions />)
+
+    await userEvent.type(screen.getByLabelText('Ask FIN a financial question'), 'How much emergency reserve should I keep?')
+    await userEvent.click(screen.getByRole('button', { name: 'Ask FIN' }))
+
+    expect(screen.getByRole('heading', { name: 'Emergency fund' })).toBeTruthy()
+    expect(screen.getByText(/months covered/)).toBeTruthy()
+  })
+
+  it('renders all retirement engines and recalculates the required corpus', () => {
+    render(<FinancialDecisions />)
+
+    expect(screen.getByRole('heading', { name: 'FS Retirement Model' })).toBeTruthy()
+    for (const engine of [
+      'Retirement Needs',
+      'Inflation',
+      'Retirement Income',
+      'Investment Projection',
+      'Retirement Corpus',
+      'FI Date',
+      'Contribution Optimizer',
+      'Scenario',
+      'Stress / Monte Carlo Engine',
+      'Insurance Coverage Engine',
+    ]) expect(screen.getByText(engine)).toBeTruthy()
+
+    const corpusPanel = screen.getByText('Retirement Corpus').closest('article')
+    const initialCorpus = corpusPanel?.querySelector(':scope > strong')?.textContent
+    fireEvent.change(screen.getByLabelText('Annual Inflation'), { target: { value: '6' } })
+
+    expect(corpusPanel?.querySelector(':scope > strong')?.textContent).not.toBe(initialCorpus)
+  })
+
+  it('links retirement fields from Build Profile and marks their boxes', () => {
+    window.localStorage.setItem('fms:build-profile', JSON.stringify({
+      profileId: 'PRO-LINKED',
+      values: {
+        dateOfBirth: '1990-01-01',
+        'expense-housing': '18000',
+        'expense-groceries': '12000',
+        'asset-retirement-fund': '600000',
+        'asset-provident-fund': '400000',
+        'income-salary': '70000',
+        'income-business': '10000',
+        'expense-retirement-savings': '15000',
+      },
+      documents: [],
+      suitabilityAnswers: {},
+      coBorrowers: [],
+      guarantors: [],
+      additionalCollaterals: [],
+    }))
+
+    render(<FinancialDecisions />)
+
+    const linkedInputs = [
+      screen.getByLabelText('Current Age'),
+      screen.getByLabelText('Current Monthly Income'),
+      screen.getByLabelText('Current Monthly Expenses'),
+      screen.getByLabelText('Current Retirement Savings'),
+      screen.getByLabelText('Monthly Investment'),
+    ]
+    expect(linkedInputs.map((input) => (input as HTMLInputElement).value)).toEqual(['36', '80000', '45000', '1000000', '15000'])
+    linkedInputs.forEach((input) => expect(input.parentElement?.classList.contains('is-profile-linked')).toBe(true))
+
+    fireEvent.change(linkedInputs[4], { target: { value: '20000' } })
+    expect(linkedInputs[4].parentElement?.classList.contains('is-profile-linked')).toBe(false)
+  })
+
+  it('refreshes all decisions from the latest remote Build Profile', async () => {
+    mockFetchAutosaveDraft.mockResolvedValue({
+      payload: {
+        profileId: 'PRO-REMOTE',
+        values: {
+          'income-salary': '90000',
+          'income-business': '10000',
+          'expense-housing': '20000',
+          'expense-groceries': '10000',
+        },
+        documents: [],
+        suitabilityAnswers: {},
+        coBorrowers: [],
+        guarantors: [],
+        additionalCollaterals: [],
+      },
+      revision: 2,
+      updatedAt: '2026-09-30T10:00:00Z',
+    })
+
+    render(<FinancialDecisions />)
+    await userEvent.click(screen.getByRole('button', { name: 'Refresh Profile' }))
+
+    expect(mockFetchAutosaveDraft).toHaveBeenCalledWith('build-profile', 'current')
+    expect((screen.getByLabelText('Net Monthly Income') as HTMLInputElement).value).toBe('100000')
+    expect(screen.getByText(/Latest profile loaded/)).toBeTruthy()
+  })
+})

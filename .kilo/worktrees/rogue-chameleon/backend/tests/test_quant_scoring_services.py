@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import unittest
+from types import SimpleNamespace
+
+from app.services.ai_orchestrator import AIOrchestrator
+from app.services.overall_scoring_engine import compute_quant_score_package
+
+
+class StubEngine:
+    def __init__(self, name, result, calls):
+        self.name = name
+        self.result = result
+        self.calls = calls
+
+    def evaluate(self, *args):
+        self.calls.append((self.name, args))
+        return self.result
+
+
+class QuantScoringServiceTests(unittest.TestCase):
+    def test_quant_score_summary_matches_expected_values(self) -> None:
+        payload = SimpleNamespace(
+            product_type="Auto Loan",
+            gov_id="",
+            email="",
+            phone="",
+            loan_amount=0.0,
+            interest_rate=0.0,
+            term_months=12,
+            monthly_income=0.0,
+            other_income=0.0,
+            debt_obligations=0.0,
+            requirements={
+                "optionalPsychometricQuestionnaire": {},
+                "bankingRelationships": {},
+                "enhancedDueDiligence": {},
+                "employmentInformation": {},
+                "addressInformation": {},
+                "applicantPersonal": {},
+                "supportingDocuments": {},
+                "collateralAssetDetails": {},
+                "productInformation": {},
+            },
+        )
+
+        result = compute_quant_score_package(payload)
+
+        self.assertEqual(
+            result["quant_scores"],
+            {
+                "creditScore": 7,
+                "creditBureauScore": 0,
+                "fraudScore": 20,
+                "socialScore": 0,
+                "psychometricScore": 0,
+                "relationshipScore": 88,
+                "profitabilityScore": 79,
+                "overallScore": 24,
+                "compositeScore": 240,
+                "finalGrade": "F",
+                "finalRating": "Critical",
+                "decision": "DECLINE",
+            },
+        )
+        self.assertEqual(result["overall_scores"]["final_decision"], "DECLINE")
+        self.assertEqual(result["relationship_scores"]["relationship_score"], 88.0)
+
+    def test_ai_orchestrator_calls_engines_in_expected_order(self) -> None:
+        payload = SimpleNamespace(loan_amount=450000.0, requirements={})
+        calls = []
+        credit = {"total_credit_score": 825.0}
+        fraud = {"overall_fraud_score": 76.0}
+        behavior = {"overall_psychometric_score": 81.0}
+        social = {"overall_social_score": 72.0}
+        risk = {
+            "relationship_scores": {"relationship_score": 88.0},
+            "credit_bureau_reports": {"bureau_score": 825.0},
+            "collateral_scores": {"overall_collateral_score": 81.0},
+            "overall_credit_risk_score": 82.25,
+        }
+        profit = {"profitability_score": 79.0}
+        decision = {
+            "final_score": 82.0,
+            "final_grade": "A-",
+            "decision": "APPROVE",
+        }
+        orchestrator = AIOrchestrator(
+            credit_engine=StubEngine("credit", credit, calls),
+            fraud_engine=StubEngine("fraud", fraud, calls),
+            psychometric_engine=StubEngine("behavior", behavior, calls),
+            social_engine=StubEngine("social", social, calls),
+            credit_risk_engine=StubEngine("risk", risk, calls),
+            profitability_engine=StubEngine("profit", profit, calls),
+            decision_engine=StubEngine("decision", decision, calls),
+        )
+
+        result = orchestrator.evaluate(payload)
+
+        self.assertEqual(
+            [name for name, _ in calls],
+            ["credit", "fraud", "behavior", "social", "risk", "profit", "decision"],
+        )
+        self.assertIs(calls[4][1][1], credit)
+        self.assertIs(calls[4][1][2], fraud)
+        self.assertIs(calls[6][1][0], credit)
+        self.assertIs(calls[6][1][1], fraud)
+        self.assertIs(calls[6][1][2], behavior)
+        self.assertIs(calls[6][1][3], social)
+        self.assertIs(calls[6][1][4], risk)
+        self.assertIs(calls[6][1][5], profit)
+        self.assertEqual(result["quant_scores"]["overallScore"], 82)
+        self.assertEqual(result["ai_recommendations"]["ai_model"], "ai-orchestrator-v1")
+
+    def test_loan_restructuring_caps_overall_score_at_bronze(self) -> None:
+        payload = SimpleNamespace(
+            loan_amount=450000.0,
+            requirements={
+                "enhancedDueDiligence": {
+                    "previousLoanRestructuringDisclosures": "true",
+                }
+            },
+        )
+        calls = []
+        orchestrator = AIOrchestrator(
+            credit_engine=StubEngine("credit", {"total_credit_score": 90.0}, calls),
+            fraud_engine=StubEngine("fraud", {"overall_fraud_score": 90.0}, calls),
+            psychometric_engine=StubEngine("behavior", {"overall_psychometric_score": 90.0}, calls),
+            social_engine=StubEngine("social", {"overall_social_score": 90.0}, calls),
+            credit_risk_engine=StubEngine(
+                "risk",
+                {
+                    "relationship_scores": {"relationship_score": 90.0},
+                    "credit_bureau_reports": {"bureau_score": 90.0},
+                    "collateral_scores": {"overall_collateral_score": 90.0},
+                    "overall_credit_risk_score": 90.0,
+                },
+                calls,
+            ),
+            profitability_engine=StubEngine("profit", {"profitability_score": 90.0}, calls),
+            decision_engine=StubEngine(
+                "decision",
+                {
+                    "final_score": 90.0,
+                    "composite_score": 900,
+                    "final_grade": "A+",
+                    "final_rating": "Exceptional",
+                    "decision": "APPROVE",
+                },
+                calls,
+            ),
+        )
+
+        result = orchestrator.evaluate(payload)
+
+        self.assertEqual(result["quant_scores"]["overallScore"], 59)
+        self.assertEqual(result["quant_scores"]["compositeScore"], 590)
+        self.assertEqual(result["quant_scores"]["finalGrade"], "Bronze 1")
+        self.assertEqual(result["quant_scores"]["finalRating"], "Elevated Risk")
+        self.assertEqual(result["quant_scores"]["decision"], "REVIEW")

@@ -1,0 +1,75 @@
+{
+  "app": {
+    "name": "Financial Health",
+    "shortDescription": "Secure fleet, lending, and credit workflow operations in one mobile workspace.",
+    "fullDescription": "Financial Health helps authorized teams manage fleet operations, borrower records, loan workflows, supporting documents, and audit-ready credit processes from a single secure mobile workspace. Current features include role-based access, secure authentication, loan origination support, document handling, meeting-audio transcription workflows, and operational dashboards for credit, compliance, and workflow visibility.",
+    "primaryCategory": "Business",
+    "secondaryCategory": "Productivity",
+    "supportEmail": "admin@quantech.international",
+    "inAppSupportRoute": "/support",
+    "supportUrl": "https://fleetmanagement-flame.vercel.app/support",
+    "marketingUrl": "https://fleetmanagement-flame.vercel.app",
+    "privacyPolicyUrl": "https://fleetmanagement-flame.vercel.app/privacy",
+    "termsUrl": "https://fleetmanagement-flame.vercel.app/terms",
+    "publicPagesChecklist": {
+      "supportRouteImplemented": true,
+      "privacyRouteImplemented": true,
+      "termsRouteImplemented": true,
+      "publicDomainDeployed": true
+    }
+  },
+  "googlePlay": {
+    "applicationId": "com.fms.mobile",
+    "contentRating": "Pending questionnaire",
+    "targetCountries": [
+      "US",
+      "GB",
+      "CA"
+    ],
+    "dataSafety": {
+      "collectsPersonalData": true,
+      "dataEncryptedInTransit": true,
+      "userCanRequestDeletion": true
+    },
+    "listingNotes": {
+      "reviewFocus": [
+        "Authenticated fleet and lending workflows",
+        "Loan application and borrower record handling",
+        "Audio transcription and meeting-minutes workflows for authorized users"
+      ],
+      "requiredAssets": [
+        "Phone screenshots",
+        "Feature graphic if required by marketing",
+        "Privacy policy URL",
+        "Support URL"
+      ]
+    },
+    "release": {
+      "track": "internal",
+      "rolloutPercent": 5
+    }
+  },
+  "appStore": {
+    "bundleId": "com.fms.mobile",
+    "ageRating": "Pending questionnaire",
+    "availability": "All territories",
+    "appReview": {
+      "contactFirstName": "",
+      "contactLastName": "",
+      "contactPhone": "",
+      "contactEmail": "admin@quantech.international",
+      "demoAccountRequired": true,
+      "demoUsername": "",
+      "demoPassword": "",
+      "notes": "Provide App Review with a working demo account, plus notes covering login, account deletion, AI meeting workflows, document parsing, and any role-restricted features."
+    },
+    "privacyNutritionLabels": {
+      "tracking": "To be completed",
+      "dataLinkedToUser": "To be completed",
+      "dataNotLinkedToUser": "To be completed"
+    },
+    "release": {
+      "phasedRelease": true
+    }
+  }
+}

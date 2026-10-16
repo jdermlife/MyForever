@@ -1,0 +1,28 @@
+/// <reference types="vite/client" />
+
+declare interface ImportMetaEnv {
+  readonly VITE_API_URL?: string
+  readonly VITE_API_FALLBACK_URL?: string
+  readonly VITE_GOOGLE_CLIENT_ID?: string
+  readonly VITE_GOOGLE_ALLOWED_HOSTS?: string
+  readonly VITE_APPLE_CLIENT_ID?: string
+  readonly VITE_APPLE_IOS_CLIENT_ID?: string
+  readonly VITE_APPLE_REDIRECT_URI?: string
+  readonly VITE_TURNSTILE_SITE_KEY?: string
+  readonly VITE_PAYPAL_CLIENT_ID?: string
+  readonly VITE_PAYPAL_PLAN_ID_SINGLE_PROFILE?: string
+  readonly VITE_PAYPAL_PLAN_ID_MULTIPLE_PROFILE?: string
+  readonly VITE_PAYMENT_DEFAULT_CHANNEL?: string
+  readonly VITE_PAYMENT_BANK_ACCOUNT_NAME?: string
+  readonly VITE_PAYMENT_BANK_ACCOUNT_NO?: string
+  readonly VITE_PAYMENT_BANK_NAME?: string
+  readonly VITE_PAYMENT_GCASH_NUMBER?: string
+  readonly VITE_PAYMENT_GCASH_NAME?: string
+  readonly VITE_PAYMENT_MAYA_NUMBER?: string
+  readonly VITE_PAYMENT_MAYA_NAME?: string
+  readonly VITE_PAYMENT_SUPPORT_EMAIL?: string
+}
+
+declare interface ImportMeta {
+  readonly env: ImportMetaEnv
+}
