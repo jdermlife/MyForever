@@ -1,0 +1,1 @@
+# The Wear OS module uses only framework UI classes.

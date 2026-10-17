@@ -21,14 +21,14 @@ const config: CapacitorConfig = {
     SplashScreen: {
       launchShowDuration: 1200,
       launchAutoHide: true,
-      backgroundColor: '#b8860b',
+      backgroundColor: '#eff6ff',
       androidSplashResourceName: 'splash_transparent',
       androidScaleType: 'CENTER_CROP',
       showSpinner: false,
     },
     StatusBar: {
       style: 'DARK',
-      backgroundColor: '#b8860b',
+      backgroundColor: '#eff6ff',
     },
     SystemBars: {
       style: 'DARK',

@@ -86,6 +86,16 @@ Native project locations:
 - Android: `frontend/android`
 - iOS: `frontend/ios`
 
+### Native Financial UI
+
+- The iOS phone app uses the existing Capacitor pages with native safe-area and touch-target styling. It does not maintain a separate scoring implementation.
+- The Wear OS app is the `wear` module under `frontend/android`. Its swipeable views mirror FILScore, wealth, budget, financial health, and bill-calendar summaries without recomputing values.
+- Build the Wear OS debug app from the repository root with:
+   ```powershell
+   .\frontend\android\gradlew.bat -p .\frontend\android :wear:assembleDebug
+   ```
+- The Wear UI reads optional values from the `wear_snapshot` shared-preferences file. When no companion snapshot has been supplied, it renders an `Awaiting phone sync` state rather than sample financial data.
+
 ## Authentication
 
 Protected endpoints require a JWT token in the Authorization header:

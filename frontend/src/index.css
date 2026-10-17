@@ -21027,3 +21027,39 @@ html.native-mobile-app body {
 .native-mobile-app .credit-health-certificate-detail-card {
   grid-column: auto !important;
 }
+
+/* iOS phone keeps the existing pages, with native spacing and touch ergonomics. */
+html.native-mobile-app[data-platform='ios'] {
+  background: #eff6ff;
+}
+
+.native-mobile-app[data-platform='ios'] body {
+  background: linear-gradient(180deg, #eff6ff 0, #ffffff 220px);
+}
+
+.native-mobile-app[data-platform='ios'] .sidebar {
+  padding-top: max(10px, env(safe-area-inset-top));
+  padding-inline: max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right));
+}
+
+.native-mobile-app[data-platform='ios'] .content {
+  padding-right: max(10px, env(safe-area-inset-right));
+  padding-bottom: max(76px, calc(60px + env(safe-area-inset-bottom)));
+  padding-left: max(10px, env(safe-area-inset-left));
+}
+
+.native-mobile-app[data-platform='ios'] :is(button, a, input, select, textarea) {
+  min-height: 44px;
+}
+
+.native-mobile-app[data-platform='ios'] :is(
+  .psychometric-page,
+  .financial-health-page,
+  .budget-dashboard-page,
+  .loan-monitoring-dashboard-page,
+  .bill-reminder-dashboard-page
+) {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
