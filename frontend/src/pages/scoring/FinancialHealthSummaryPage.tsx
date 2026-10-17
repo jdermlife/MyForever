@@ -20,8 +20,10 @@ import { useSelectedAnalysisEntity } from '../../hooks/useSelectedAnalysisEntity
 import { calculateAndSaveMonthlyProfile } from '../../services/profilemonthlysnapshotcalculator'
 import FinancialStatementModal from '../admin/AdminFinancialStatementPage'
 import { WatchSync } from '../../native/watchSync'
-
-
+import BudgetUtilizationGraph, { type BudgetUtilizationGraphValue } from './BudgetUtilizationGraph'
+import CreditHealthScoreGraph, { type CreditHealthGraphScores } from './CreditHealthScoreGraph'
+import FinancialHealthRingGraph from './FinancialHealthRingGraph'
+import WealthBalanceRadar from './WealthBalanceRadar'
 
 import {
   buildFinancialHealthGroupRings,
@@ -307,17 +309,6 @@ const TREND_CHART_LEFT = 52
 const TREND_CHART_RIGHT = 694
 const TREND_CHART_TOP = 24
 const TREND_CHART_BOTTOM = 238
-const FINANCIAL_HEALTH_RING_LEGEND = [
-  'Gold · Foundation',
-  'Silver · Controls',
-  'Bronze · Future',
-] as const
-const FINANCIAL_HEALTH_RING_STROKES = [
-  'url(#financial-health-ring-gold)',
-  'url(#financial-health-ring-silver)',
-  'url(#financial-health-ring-bronze)',
-] as const
-
 function trendChartX(index: number, count: number): number {
   return TREND_CHART_LEFT + (index * (TREND_CHART_RIGHT - TREND_CHART_LEFT)) / Math.max(count - 1, 1)
 }
@@ -492,6 +483,61 @@ function formatCurrency(value: number, currency: string): string {
   }).format(value)
 }
 
+function findNumericField(value: unknown, fieldNames: readonly string[], depth = 0): number | null {
+  if (!value || typeof value !== 'object' || depth > 5) return null
+  const record = value as Record<string, unknown>
+  for (const fieldName of fieldNames) {
+    const candidate = record[fieldName]
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate
+  }
+  for (const candidate of Object.values(record)) {
+    const nested = findNumericField(candidate, fieldNames, depth + 1)
+    if (nested !== null) return nested
+  }
+  return null
+}
+
+function buildBudgetUtilization(
+  draft: BudgetHealthDraftInput | undefined,
+  fallbackBudget: number,
+  fallbackUtilized: number,
+): BudgetUtilizationGraphValue {
+  const savedExpenseRows = (draft?.savedSetup ?? []).filter((item) => item.type === 'expense')
+  const actualEntries = draft?.actualEntries ?? {}
+  const actualExpenseRows = savedExpenseRows.filter((item) => String(actualEntries[item.id] ?? '').trim() !== '')
+  const hasActualExpenses = actualExpenseRows.length > 0
+  const hasSavedExpenseBudget = savedExpenseRows.length > 0
+  const expenseDraftBudget = Object.values(draft?.expenseDraft ?? {}).reduce<number>((total, value) => {
+    const amount = Number(value)
+    return total + (Number.isFinite(amount) && amount > 0 ? amount : 0)
+  }, 0)
+  const budgetAmount = hasActualExpenses
+    ? actualExpenseRows.reduce((total, item) => total + item.setupAmount, 0)
+    : hasSavedExpenseBudget
+      ? savedExpenseRows.reduce((total, item) => total + item.setupAmount, 0)
+      : expenseDraftBudget || fallbackBudget
+  const utilizedAmount = hasActualExpenses
+    ? actualExpenseRows.reduce((total, item) => total + Math.max(0, Number(actualEntries[item.id]) || 0), 0)
+    : hasSavedExpenseBudget
+      ? 0
+      : fallbackUtilized
+  const utilizationPercent = budgetAmount > 0 ? (utilizedAmount / budgetAmount) * 100 : 0
+
+  return {
+    budgetAmount,
+    utilizedAmount,
+    utilizationPercent,
+    progressPercent: Math.min(100, utilizationPercent),
+    overflowPercent: Math.min(100, Math.max(0, utilizationPercent - 100)),
+    remainingAmount: Math.max(0, budgetAmount - utilizedAmount),
+    sourceLabel: hasActualExpenses
+      ? 'from entered actuals'
+      : hasSavedExpenseBudget
+        ? 'awaiting actual expenses'
+        : 'from current financial data',
+  }
+}
+
 function resolveInvestmentSuitabilityRisk(
   suitabilityAnswers: Record<string, string>,
   investments: Array<Record<string, string>>,
@@ -542,6 +588,7 @@ export default function FinancialHealthSummaryPage() {
   const [wealthFoundationScore, setWealthFoundationScore] = useState<WealthFoundationScoreResult | null>(null)
   const [budgetHealthScore, setBudgetHealthScore] = useState<BudgetHealthScoreResult | null>(null)
   const [lendingLeafScores, setLendingLeafScores] = useState<LendingLeafScores | null>(null)
+  const [creditHealthPayload, setCreditHealthPayload] = useState<unknown>(null)
   const [publishedSummary, setPublishedSummary] = useState(DEFAULT_FINANCIAL_HEALTH_SUMMARY)
   const [summaryInputsLoaded, setSummaryInputsLoaded] = useState(false)
   const [summaryComputedAt, setSummaryComputedAt] = useState<Date | null>(null)
@@ -603,6 +650,7 @@ export default function FinancialHealthSummaryPage() {
       setSummaryInputsLoaded(false)
       setSummaryComputedAt(null)
       setMonthlyProfileResult(null)
+      setCreditHealthPayload(null)
 
       const analysisEntityKey = entityKey || 'identity-pending'
       const lendingEntityKey = selectedApplicationNo || 'new'
@@ -664,7 +712,9 @@ export default function FinancialHealthSummaryPage() {
           }))
         })
         void creditHealthDraftRequest.then((draft) => {
-          if (disposed || !hasMeaningfulValue(draft?.payload)) return
+          if (disposed) return
+          setCreditHealthPayload(draft?.payload ?? null)
+          if (!hasMeaningfulValue(draft?.payload)) return
           setJourneyStepCompletion((current) => ({ ...current, creditHealth: true }))
         })
 
@@ -768,6 +818,7 @@ export default function FinancialHealthSummaryPage() {
           setWealthFoundationScore(null)
           setBudgetHealthScore(null)
           setLendingLeafScores(null)
+          setCreditHealthPayload(null)
           setMonthlySnapshotDrafts(null)
           setJourneyStepCompletion((current) => ({
             ...current,
@@ -861,6 +912,56 @@ export default function FinancialHealthSummaryPage() {
     [financialHealthIndicators],
   )
   const index = publishedSummary.index
+  const glanceCreditScores = useMemo<CreditHealthGraphScores>(() => ({
+    credit: toFilscore(
+      findNumericField(creditHealthPayload, ['credit_score', 'creditScore'])
+        ?? lendingLeafScores?.creditScore
+        ?? null,
+    ),
+    creditBureau: toFilscore(
+      findNumericField(creditHealthPayload, ['credit_bureau_score', 'creditBureauScore', 'bureau_score'])
+        ?? null,
+    ),
+    nonStarter: toFilscore(
+      findNumericField(creditHealthPayload, ['fraud_score', 'nonStarterScore', 'non_starter_score'])
+        ?? lendingLeafScores?.nonStarterScore
+        ?? null,
+    ),
+    social: toFilscore(
+      findNumericField(creditHealthPayload, ['social_score', 'socialScore'])
+        ?? lendingLeafScores?.socialScore
+        ?? null,
+    ),
+    psychometric: toFilscore(
+      findNumericField(creditHealthPayload, ['psychometric_score', 'psychometricScore'])
+        ?? lendingLeafScores?.psychometricScore
+        ?? null,
+    ),
+  }), [creditHealthPayload, lendingLeafScores])
+  const glanceWealthScores = useMemo(() => {
+    const netWorthDraft = monthlySnapshotDrafts?.netWorth
+    const suitabilityValues = Object.values(netWorthDraft?.suitabilityAnswers ?? {})
+    const wealthBehaviour = suitabilityValues.length > 0
+      ? Math.round((averageScore(suitabilityValues) / 4) * 100)
+      : 0
+    const actualEntries = Object.values(netWorthDraft?.actualEntries ?? {})
+    const completedActualEntries = actualEntries.filter((value) => String(value ?? '').trim() !== '').length
+    const wealthAuthenticity = actualEntries.length > 0
+      ? Math.round((completedActualEntries / actualEntries.length) * 100)
+      : 0
+
+    return {
+      netWorthPositioning: netWorthBuildingScore?.score ?? 200,
+      wealthBehaviour,
+      wealthFoundation: wealthFoundationScore?.score ?? 0,
+      wealthAuthenticity,
+    }
+  }, [monthlySnapshotDrafts?.netWorth, netWorthBuildingScore?.score, wealthFoundationScore?.score])
+  const glanceBudgetUtilization = useMemo(() => buildBudgetUtilization(
+    monthlySnapshotDrafts?.budget,
+    netWorthBuildingScore?.metrics.monthlyExpenses ?? 0,
+    netWorthBuildingScore?.metrics.monthlyExpenses ?? 0,
+  ), [monthlySnapshotDrafts?.budget, netWorthBuildingScore?.metrics.monthlyExpenses])
 
   useEffect(() => {
     if (!summaryInputsLoaded || (summaryComputedAt && !isRefreshingSummary)) return
@@ -882,6 +983,11 @@ const snapshot = {
 
   financialHealth: {
     value: publishedSummary.score,
+    band,
+    groups: publishedSummary.groups.map((group) => ({
+      id: group.id,
+      value: group.value,
+    })),
     trend: [
       ...financialHealthSnapshots.map(
         (item) => item.payload.score,
@@ -891,19 +997,11 @@ const snapshot = {
   },
 
   creditHealth: {
-    value: lendingLeafScores?.creditScore ?? null,
-
-    creditScore:
-      lendingLeafScores?.creditScore ?? null,
-
-    psychometricScore:
-      lendingLeafScores?.psychometricScore ?? null,
-
-    socialScore:
-      lendingLeafScores?.socialScore ?? null,
-
-    nonStarterScore:
-      lendingLeafScores?.nonStarterScore ?? null,
+    creditScore: glanceCreditScores.credit,
+    creditBureauScore: glanceCreditScores.creditBureau,
+    psychometricScore: glanceCreditScores.psychometric,
+    socialScore: glanceCreditScores.social,
+    nonStarterScore: glanceCreditScores.nonStarter,
 
     trend: financialHealthSnapshots
       .map(
@@ -971,6 +1069,13 @@ const snapshot = {
       ),
   },
 
+  wealthBalance: {
+    netWorthPositioning: glanceWealthScores.netWorthPositioning,
+    wealthBehaviour: glanceWealthScores.wealthBehaviour,
+    wealthFoundation: glanceWealthScores.wealthFoundation,
+    wealthAuthenticity: glanceWealthScores.wealthAuthenticity,
+  },
+
   netWorth: {
     actual:
       netWorthMetrics?.netWorth ??
@@ -998,6 +1103,13 @@ const snapshot = {
     expenses:
       netWorthMetrics?.monthlyExpenses ??
       null,
+
+    utilizationPercent: glanceBudgetUtilization.utilizationPercent,
+    utilizedAmount: glanceBudgetUtilization.utilizedAmount,
+    budgetAmount: glanceBudgetUtilization.budgetAmount,
+    remainingAmount: glanceBudgetUtilization.remainingAmount,
+    overflowPercent: glanceBudgetUtilization.overflowPercent,
+    sourceLabel: glanceBudgetUtilization.sourceLabel,
 
     net:
       netWorthMetrics?.monthlyCashFlow ??
@@ -1046,6 +1158,9 @@ const snapshot = {
   netWorthBuildingScore,
   budgetHealthScore,
   lendingLeafScores,
+  glanceBudgetUtilization,
+  glanceCreditScores,
+  glanceWealthScores,
   monthlySnapshotDrafts,
   financialHealthSnapshots,
   step8ProfileMetrics,
@@ -1054,44 +1169,6 @@ const snapshot = {
 
 
 
-
-
-
-
-
-// No new Financial Health calculation is performed here.
-useEffect(() => {
-  if (!summaryInputsLoaded || !summaryComputedAt) return
-
-  void WatchSync.updateSnapshot({
-    snapshot: {
-      updatedAt: summaryComputedAt.toISOString(),
-
-      financialHealth: {
-        value: publishedSummary.score,
-        trend: financialHealthSnapshots.map(
-          (snapshot) => snapshot.payload.score,
-        ),
-      },
-
-      wealthBuilding: {
-        value: netWorthBuildingScore?.normalizedScore ?? null,
-      },
-    },
-  }).catch((error) => {
-    console.warn('Unable to update Apple Watch snapshot:', error)
-  })
-}, [
-  summaryInputsLoaded,
-  summaryComputedAt,
-  publishedSummary,
-  netWorthBuildingScore,
-  budgetHealthScore,
-  lendingLeafScores,
-  monthlySnapshotDrafts,
-  financialHealthSnapshots,
-  step8ProfileMetrics,
-])
 
 
 
@@ -1494,76 +1571,7 @@ useEffect(() => {
 
         <FinancialHealthJourneyMenu className="financial-health-journey-menu-in-hero" />
 
-        <figure
-          className="financial-health-ring-figure"
-          aria-label={`Financial Health score ${score} out of 1000, rated ${band}`}
-        >
-          <div className="financial-health-ring-visual">
-            <svg viewBox="0 0 184 184" aria-hidden="true">
-              <defs>
-                <linearGradient id="financial-health-ring-gold" x1="22" y1="20" x2="162" y2="164" gradientUnits="userSpaceOnUse">
-                  <stop offset="0" stopColor="#7b5008" />
-                  <stop offset="0.24" stopColor="#f4c54f" />
-                  <stop offset="0.43" stopColor="#ffe99a" />
-                  <stop offset="0.68" stopColor="#d69a1e" />
-                  <stop offset="1" stopColor="#845508" />
-                </linearGradient>
-                <linearGradient id="financial-health-ring-silver" x1="22" y1="20" x2="162" y2="164" gradientUnits="userSpaceOnUse">
-                  <stop offset="0" stopColor="#656b73" />
-                  <stop offset="0.24" stopColor="#d5d9de" />
-                  <stop offset="0.43" stopColor="#f7f8f9" />
-                  <stop offset="0.68" stopColor="#adb3ba" />
-                  <stop offset="1" stopColor="#686e76" />
-                </linearGradient>
-                <linearGradient id="financial-health-ring-bronze" x1="22" y1="20" x2="162" y2="164" gradientUnits="userSpaceOnUse">
-                  <stop offset="0" stopColor="#663213" />
-                  <stop offset="0.24" stopColor="#c67a3b" />
-                  <stop offset="0.43" stopColor="#f0ad70" />
-                  <stop offset="0.68" stopColor="#a95726" />
-                  <stop offset="1" stopColor="#653012" />
-                </linearGradient>
-              </defs>
-              {groupRings.map((ring, index) => (
-                <g key={ring.label} transform="rotate(-90 92 92)">
-                  <circle
-                    className="financial-health-ring-track"
-                    cx="92"
-                    cy="92"
-                    r={ring.radius}
-                    pathLength="100"
-                  />
-                  <circle
-                    className="financial-health-ring-progress"
-                    cx="92"
-                    cy="92"
-                    r={ring.radius}
-                    pathLength="100"
-                    stroke={FINANCIAL_HEALTH_RING_STROKES[index]}
-                    strokeDasharray={`${ring.value} ${100 - ring.value}`}
-                  />
-                </g>
-              ))}
-            </svg>
-            <div className="financial-health-ring-score">
-              <strong>{score}</strong>
-              <span>/ 1000</span>
-            </div>
-          </div>
-          <figcaption className="financial-health-ring-legend">
-            {groupRings.map((ring, index) => (
-              <span key={ring.label}>
-                <i
-                  style={{
-                    background: ring.color,
-                    boxShadow: `0 0 8px ${ring.color}`,
-                  }}
-                  aria-hidden="true"
-                />
-                {FINANCIAL_HEALTH_RING_LEGEND[index]}
-              </span>
-            ))}
-          </figcaption>
-        </figure>
+        <FinancialHealthRingGraph score={score} band={band} rings={groupRings} />
       </section>
 
       <section className="financial-health-compute-bar" aria-label="Financial Health computation controls">
@@ -2409,12 +2417,45 @@ useEffect(() => {
             kicker="In a Glance"
             title="Monthly Profile Scores"
           >
+            <div className="financial-health-glance-grid">
+              <article className="financial-health-glance-card">
+                <header>
+                  <span>Financial Summary</span>
+                  <h3>Financial Health Ring</h3>
+                </header>
+                <FinancialHealthRingGraph score={score} band={band} rings={groupRings} />
+              </article>
+              <article className="financial-health-glance-card">
+                <header>
+                  <span>Lending Scorecard</span>
+                  <h3>Credit Health</h3>
+                </header>
+                <CreditHealthScoreGraph scores={glanceCreditScores} />
+              </article>
+              <article className="financial-health-glance-card">
+                <header>
+                  <span>Net Worth Building</span>
+                  <h3>Wealth Building Radar</h3>
+                </header>
+                <WealthBalanceRadar {...glanceWealthScores} />
+              </article>
+              <article className="financial-health-glance-card">
+                <header>
+                  <span>Budget &amp; Expense Tracker</span>
+                  <h3>Budget Tracking</h3>
+                </header>
+                <BudgetUtilizationGraph
+                  value={glanceBudgetUtilization}
+                  formatAmount={(amount) => formatCurrency(amount, benchmarkContext.currency)}
+                />
+              </article>
+            </div>
             <p>
               {monthlyProfileResult
                 ? `Calculated and saved for ${formatReportingMonth(monthlyProfileResult.snapshot.snapshot_month.slice(0, 7))}.`
                 : 'Save a monthly snapshot to calculate and display the monthly profile scores.'}
             </p>
-            <div className="financial-health-equation">
+            <div className="financial-health-equation financial-health-glance-snapshot">
               {monthlyProfileResult ? (
                 <ul className="financial-health-score-summary" aria-label="Saved monthly profile scores">
                   <li><strong>Financial Health:</strong><span>{monthlyProfileResult.snapshot.financial_health_score ?? 'Pending'} / 1000</span></li>

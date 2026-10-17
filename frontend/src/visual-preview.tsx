@@ -1,5 +1,6 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
 
 import './index.css'
 import CreditScoring from './pages/scoring/CreditScoring'
@@ -12,8 +13,10 @@ document.documentElement.classList.toggle('native-mobile-app', nativePreview)
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <main className="content">
-      {page === 'psychometric' ? <CreditScoring /> : <FinancialHealthSummaryPage />}
-    </main>
+    <BrowserRouter>
+      <main className="content">
+        {page === 'psychometric' ? <CreditScoring /> : <FinancialHealthSummaryPage />}
+      </main>
+    </BrowserRouter>
   </React.StrictMode>,
 )

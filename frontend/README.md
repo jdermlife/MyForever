@@ -89,12 +89,12 @@ Native project locations:
 ### Native Financial UI
 
 - The iOS phone app uses the existing Capacitor pages with native safe-area and touch-target styling. It does not maintain a separate scoring implementation.
-- The Wear OS app is the `wear` module under `frontend/android`. Its swipeable views mirror FILScore, wealth, budget, financial health, and bill-calendar summaries without recomputing values.
+- The Wear OS app is the `wear` module under `frontend/android`. Its swipeable views mirror the Financial Summary ring, Lending Scorecard credit rings, Net Worth Building radar, Budget & Expense Tracker utilization, and bill-calendar summary without recomputing business scores.
 - Build the Wear OS debug app from the repository root with:
    ```powershell
    .\frontend\android\gradlew.bat -p .\frontend\android :wear:assembleDebug
    ```
-- The Wear UI reads optional values from the `wear_snapshot` shared-preferences file. When no companion snapshot has been supplied, it renders an `Awaiting phone sync` state rather than sample financial data.
+- The Android Capacitor `WatchSync` plugin sends the computed snapshot to the watch through the Wear OS Data Layer at `/financial-health-snapshot`. The Wear app stores the received values in `wear_snapshot`; until the first phone sync, it renders an `Awaiting phone sync` state rather than sample financial data.
 
 ## Authentication
 

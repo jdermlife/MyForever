@@ -20,7 +20,28 @@ export interface WatchSnapshot {
   
   financialHealth?: {
     value?: number | null;
+    band?: string | null;
+    groups?: Array<{
+      id: 'foundation' | 'control' | 'future';
+      value: number;
+    }>;
     trend?: number[];
+  };
+
+  creditHealth?: {
+    creditScore?: number | null;
+    creditBureauScore?: number | null;
+    nonStarterScore?: number | null;
+    socialScore?: number | null;
+    psychometricScore?: number | null;
+    trend?: number[];
+  };
+
+  wealthBalance?: {
+    netWorthPositioning?: number | null;
+    wealthBehaviour?: number | null;
+    wealthFoundation?: number | null;
+    wealthAuthenticity?: number | null;
   };
 
   netWorth?: {
@@ -35,6 +56,11 @@ export interface WatchSnapshot {
     income?: number | null;
     expenses?: number | null;
     utilizationPercent?: number | null;
+    utilizedAmount?: number | null;
+    budgetAmount?: number | null;
+    remainingAmount?: number | null;
+    overflowPercent?: number | null;
+    sourceLabel?: string | null;
     trend?: number[];
   };
 

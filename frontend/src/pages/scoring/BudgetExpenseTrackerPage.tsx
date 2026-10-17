@@ -19,6 +19,7 @@ import {
 } from './buildProfileReplication';
 import { buildBudgetExpenseTrackerSnapshot } from './liveTrackerMetrics';
 import { NET_WORTH_STATEMENT_ENTRIES } from './NetWorthPositioningPage';
+import BudgetUtilizationGraph from './BudgetUtilizationGraph';
 
 type WorkflowStep = 1 | 2 | 3;
 type IncomeKey = 'salary' | 'business' | 'investment' | 'pension';
@@ -1100,45 +1101,7 @@ export default function BudgetExpenseTrackerPage() {
 
         <FinancialHealthJourneyMenu className="financial-health-journey-menu-in-hero" />
 
-        <div className="budget-utilization-graph" aria-labelledby="budget-utilization-title">
-          <div className="budget-utilization-heading">
-            <div>
-              <span>Budget Performance</span>
-              <h2 id="budget-utilization-title">Budget Utilization</h2>
-            </div>
-            <strong>{budgetUtilization.utilizationPercent.toFixed(1)}%</strong>
-          </div>
-          <div
-            className="budget-utilization-track"
-            role="progressbar"
-            aria-label="Budget utilization"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={Math.round(budgetUtilization.progressPercent)}
-            aria-valuetext={`${budgetUtilization.utilizationPercent.toFixed(1)}% utilized, ${formatCurrency(budgetUtilization.utilizedAmount)} of ${formatCurrency(budgetUtilization.budgetAmount)} budget`}
-          >
-            <div className="budget-utilization-budget-shadow" />
-            <div
-              className="budget-utilization-progress"
-              style={{ width: `${budgetUtilization.progressPercent}%` }}
-            />
-          </div>
-          {budgetUtilization.overflowPercent > 0 ? (
-            <div className="budget-utilization-overflow" aria-label={`${budgetUtilization.overflowPercent.toFixed(1)}% over budget`}>
-              <span style={{ width: `${budgetUtilization.overflowPercent}%` }} />
-            </div>
-          ) : null}
-          <div className="budget-utilization-legend">
-            <span><i className="budget-utilization-swatch budget-utilization-swatch-used" />Utilized {formatCurrency(budgetUtilization.utilizedAmount)}</span>
-            <span><i className="budget-utilization-swatch budget-utilization-swatch-budget" />Budget {formatCurrency(budgetUtilization.budgetAmount)}</span>
-          </div>
-          <small>
-            {budgetUtilization.utilizationPercent > 100
-              ? `${formatCurrency(budgetUtilization.utilizedAmount - budgetUtilization.budgetAmount)} over budget`
-              : `${formatCurrency(budgetUtilization.remainingAmount)} remaining`}
-            {` ${budgetUtilization.sourceLabel}`}
-          </small>
-        </div>
+        <BudgetUtilizationGraph value={budgetUtilization} formatAmount={formatCurrency} />
       </section>
 
       <FinancialJourneyGuideLauncher applicationNo={selectedApplicationNo} currentStep="budgetTargets" />

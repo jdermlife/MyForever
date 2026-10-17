@@ -25,7 +25,7 @@ final class WearDashboardView extends View {
     private static final int MUTED = Color.rgb(165, 190, 211);
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Snapshot snapshot;
+    private Snapshot snapshot;
     private int page;
     private float touchDownX;
 
@@ -34,6 +34,11 @@ final class WearDashboardView extends View {
         snapshot = Snapshot.read(context);
         setBackgroundColor(NAVY);
         setContentDescription("FILScore Wear dashboard. Swipe left or right to change pages.");
+    }
+
+    void refreshSnapshot() {
+        snapshot = Snapshot.read(getContext());
+        invalidate();
     }
 
     @Override
@@ -51,16 +56,16 @@ final class WearDashboardView extends View {
         drawHeader(canvas, logicalWidth);
         switch (page) {
             case 0:
-                drawScoreRings(canvas, logicalWidth, logicalHeight);
+                drawFinancialHealthRings(canvas, logicalWidth, logicalHeight);
                 break;
             case 1:
-                drawWealthRadar(canvas, logicalWidth, logicalHeight);
+                drawCreditHealthRings(canvas, logicalWidth, logicalHeight);
                 break;
             case 2:
-                drawBudget(canvas, logicalWidth, logicalHeight);
+                drawWealthRadar(canvas, logicalWidth, logicalHeight);
                 break;
             case 3:
-                drawHealthGauge(canvas, logicalWidth, logicalHeight);
+                drawBudget(canvas, logicalWidth, logicalHeight);
                 break;
             default:
                 drawBillCalendar(canvas, logicalWidth, logicalHeight);
@@ -72,17 +77,16 @@ final class WearDashboardView extends View {
 
     private void drawHeader(Canvas canvas, float width) {
         text(canvas, "FILScore", width / 2f, 25f, 12f, WHITE, Paint.Align.CENTER, true);
-        String[] labels = {"HEALTH", "WEALTH", "BUDGET", "POSITION", "BILLS"};
+        String[] labels = {"FINANCIAL HEALTH", "CREDIT HEALTH", "WEALTH BUILDING", "BUDGET", "BILLS"};
         text(canvas, labels[page], width / 2f, 40f, 7f, MUTED, Paint.Align.CENTER, true);
     }
 
-    private void drawScoreRings(Canvas canvas, float width, float height) {
+    private void drawFinancialHealthRings(Canvas canvas, float width, float height) {
         float centerX = width / 2f;
         float centerY = height / 2f + 4f;
         float[] radii = {72f, 58f, 44f};
-        int[] colors = {BLUE, GREEN, RED};
-        Float[] values = {snapshot.filsScore, snapshot.financialHealth, snapshot.wealthScore};
-        float[] maximums = {1000f, 1000f, 100f};
+        int[] colors = {Color.rgb(224, 173, 47), Color.rgb(210, 214, 219), Color.rgb(197, 123, 60)};
+        Float[] values = {snapshot.foundation, snapshot.control, snapshot.future};
 
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeCap(Paint.Cap.ROUND);
@@ -95,11 +99,43 @@ final class WearDashboardView extends View {
             paint.setColor(Color.argb(58, 165, 190, 211));
             canvas.drawArc(ring, -90f, 360f, false, paint);
             paint.setColor(colors[index]);
-            canvas.drawArc(ring, -90f, sweep(values[index], maximums[index]), false, paint);
+            canvas.drawArc(ring, -90f, sweep(values[index], 100f), false, paint);
         }
         paint.setStyle(Paint.Style.FILL);
-        text(canvas, display(snapshot.filsScore, 0), centerX, centerY + 1f, 25f, WHITE, Paint.Align.CENTER, true);
-        text(canvas, "CREDIT HEALTH", centerX, centerY + 18f, 7f, MUTED, Paint.Align.CENTER, true);
+        text(canvas, display(snapshot.financialHealth, 0), centerX, centerY + 1f, 25f, WHITE, Paint.Align.CENTER, true);
+        text(canvas, "/ 1000", centerX, centerY + 18f, 7f, MUTED, Paint.Align.CENTER, true);
+        drawSyncState(canvas, width, height);
+    }
+
+    private void drawCreditHealthRings(Canvas canvas, float width, float height) {
+        float centerX = width / 2f;
+        float centerY = height / 2f + 4f;
+        float[] radii = {76f, 62f, 48f, 34f, 20f};
+        int[] colors = {BLUE, Color.rgb(20, 184, 166), RED, Color.rgb(250, 204, 21), WHITE};
+        Float[] values = {
+                snapshot.creditScore,
+                snapshot.creditBureauScore,
+                snapshot.nonStarterScore,
+                snapshot.socialScore,
+                snapshot.psychometricScore
+        };
+
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStrokeWidth(6f);
+        for (int index = 0; index < radii.length; index++) {
+            RectF ring = new RectF(
+                    centerX - radii[index], centerY - radii[index],
+                    centerX + radii[index], centerY + radii[index]
+            );
+            paint.setColor(Color.argb(48, 165, 190, 211));
+            canvas.drawArc(ring, -90f, 360f, false, paint);
+            paint.setColor(colors[index]);
+            canvas.drawArc(ring, -90f, sweep(values[index], 1000f), false, paint);
+        }
+        paint.setStyle(Paint.Style.FILL);
+        text(canvas, "FILSCORE", centerX, centerY - 1f, 8f, WHITE, Paint.Align.CENTER, true);
+        text(canvas, "Credit Health", centerX, centerY + 12f, 6f, MUTED, Paint.Align.CENTER, false);
         drawSyncState(canvas, width, height);
     }
 
@@ -107,7 +143,7 @@ final class WearDashboardView extends View {
         float centerX = width / 2f;
         float centerY = height / 2f + 4f;
         float radius = 67f;
-        int points = 5;
+        int points = 4;
 
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(1f);
@@ -135,7 +171,7 @@ final class WearDashboardView extends View {
         paint.setColor(GREEN);
         canvas.drawPath(polygon(centerX, centerY, radius, points, values), paint);
 
-        String[] labels = {"LIQ", "CASH", "GOAL", "PROTECT", "DEBT"};
+        String[] labels = {"POSITION", "BEHAVIOUR", "FOUNDATION", "AUTHENTICITY"};
         for (int index = 0; index < points; index++) {
             double angle = -Math.PI / 2 + index * Math.PI * 2 / points;
             text(
@@ -166,47 +202,17 @@ final class WearDashboardView extends View {
             float ratio = clamp(snapshot.budgetUtilization / 100f);
             roundRect(canvas, left + 14f, barTop, left + 14f + (right - left - 28f) * ratio, barTop + 14f, 7f, GREEN);
         }
-
-        text(canvas, "Income", left + 14f, top + 111f, 7f, MUTED, Paint.Align.LEFT, false);
-        text(canvas, money(snapshot.income), right - 14f, top + 111f, 8f, WHITE, Paint.Align.RIGHT, true);
-        text(canvas, "Expenses", left + 14f, top + 129f, 7f, MUTED, Paint.Align.LEFT, false);
-        text(canvas, money(snapshot.expenses), right - 14f, top + 129f, 8f, WHITE, Paint.Align.RIGHT, true);
-        drawSyncState(canvas, width, height);
-    }
-
-    private void drawHealthGauge(Canvas canvas, float width, float height) {
-        float centerX = width / 2f;
-        float centerY = height / 2f + 35f;
-        RectF gauge = new RectF(centerX - 78f, centerY - 78f, centerX + 78f, centerY + 78f);
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeCap(Paint.Cap.BUTT);
-        paint.setStrokeWidth(14f);
-        paint.setColor(RED);
-        canvas.drawArc(gauge, 150f, 80f, false, paint);
-        paint.setColor(BLUE);
-        canvas.drawArc(gauge, 230f, 50f, false, paint);
-        paint.setColor(GREEN);
-        canvas.drawArc(gauge, 280f, 80f, false, paint);
-
-        if (snapshot.financialHealth != null) {
-            float angle = 150f + 210f * clamp(snapshot.financialHealth / 1000f);
-            double radians = Math.toRadians(angle);
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeCap(Paint.Cap.ROUND);
-            paint.setStrokeWidth(3f);
-            paint.setColor(WHITE);
-            canvas.drawLine(
-                    centerX,
-                    centerY,
-                    centerX + (float) Math.cos(radians) * 58f,
-                    centerY + (float) Math.sin(radians) * 58f,
-                    paint
-            );
+        if (snapshot.overflowPercent != null && snapshot.overflowPercent > 0f) {
+            float overflowWidth = (right - left - 28f) * clamp(snapshot.overflowPercent / 100f);
+            roundRect(canvas, left + 14f, barTop + 18f, left + 14f + overflowWidth, barTop + 22f, 2f, RED);
         }
-        paint.setStyle(Paint.Style.FILL);
-        canvas.drawCircle(centerX, centerY, 5f, paint);
-        text(canvas, display(snapshot.financialHealth, 0), centerX, centerY + 31f, 25f, WHITE, Paint.Align.CENTER, true);
-        text(canvas, "FINANCIAL HEALTH", centerX, centerY + 46f, 7f, MUTED, Paint.Align.CENTER, true);
+
+        text(canvas, "Utilized", left + 14f, top + 111f, 7f, MUTED, Paint.Align.LEFT, false);
+        text(canvas, money(snapshot.utilizedAmount), right - 14f, top + 111f, 8f, WHITE, Paint.Align.RIGHT, true);
+        text(canvas, "Budget", left + 14f, top + 129f, 7f, MUTED, Paint.Align.LEFT, false);
+        text(canvas, money(snapshot.budgetAmount), right - 14f, top + 129f, 8f, WHITE, Paint.Align.RIGHT, true);
+        text(canvas, "Remaining", left + 14f, top + 147f, 7f, MUTED, Paint.Align.LEFT, false);
+        text(canvas, money(snapshot.remainingAmount), right - 14f, top + 147f, 8f, WHITE, Paint.Align.RIGHT, true);
         drawSyncState(canvas, width, height);
     }
 
@@ -347,33 +353,51 @@ final class WearDashboardView extends View {
     }
 
     private static final class Snapshot {
-        final Float filsScore;
         final Float financialHealth;
-        final Float wealthScore;
+        final Float foundation;
+        final Float control;
+        final Float future;
+        final Float creditScore;
+        final Float creditBureauScore;
+        final Float nonStarterScore;
+        final Float socialScore;
+        final Float psychometricScore;
+        final Float netWorthPositioning;
+        final Float wealthBehaviour;
+        final Float wealthFoundation;
+        final Float wealthAuthenticity;
         final Float budgetUtilization;
+        final Float budgetAmount;
+        final Float utilizedAmount;
+        final Float remainingAmount;
+        final Float overflowPercent;
         final Float income;
         final Float expenses;
         final Float billsOutstanding;
-        final Float liquidity;
-        final Float cashFlow;
-        final Float goalMomentum;
-        final Float protection;
-        final Float leverage;
         final boolean hasData;
 
         private Snapshot(SharedPreferences values) {
-            filsScore = optional(values, "fils_score");
             financialHealth = optional(values, "financial_health");
-            wealthScore = optional(values, "wealth_score");
+            foundation = optional(values, "financial_foundation");
+            control = optional(values, "financial_control");
+            future = optional(values, "financial_future");
+            creditScore = optional(values, "credit_score");
+            creditBureauScore = optional(values, "credit_bureau_score");
+            nonStarterScore = optional(values, "non_starter_score");
+            socialScore = optional(values, "social_score");
+            psychometricScore = optional(values, "psychometric_score");
+            netWorthPositioning = optional(values, "wealth_positioning");
+            wealthBehaviour = optional(values, "wealth_behaviour");
+            wealthFoundation = optional(values, "wealth_foundation");
+            wealthAuthenticity = optional(values, "wealth_authenticity");
             budgetUtilization = optional(values, "budget_utilization");
+            budgetAmount = optional(values, "budget_amount");
+            utilizedAmount = optional(values, "utilized_amount");
+            remainingAmount = optional(values, "remaining_amount");
+            overflowPercent = optional(values, "overflow_percent");
             income = optional(values, "income");
             expenses = optional(values, "expenses");
             billsOutstanding = optional(values, "bills_outstanding");
-            liquidity = optional(values, "liquidity");
-            cashFlow = optional(values, "cash_flow");
-            goalMomentum = optional(values, "goal_momentum");
-            protection = optional(values, "protection");
-            leverage = optional(values, "leverage");
             hasData = !values.getAll().isEmpty();
         }
 
@@ -383,11 +407,10 @@ final class WearDashboardView extends View {
 
         float[] wealthComponents() {
             return new float[]{
-                    valueOrZero(liquidity),
-                    valueOrZero(cashFlow),
-                    valueOrZero(goalMomentum),
-                    valueOrZero(protection),
-                    valueOrZero(leverage)
+                    normalize(valueOrZero(netWorthPositioning), 200f, 900f),
+                    clamp(valueOrZero(wealthBehaviour) / 100f) * 100f,
+                    clamp(valueOrZero(wealthFoundation) / 1000f) * 100f,
+                    clamp(valueOrZero(wealthAuthenticity) / 100f) * 100f
             };
         }
 
@@ -397,6 +420,10 @@ final class WearDashboardView extends View {
 
         private static float valueOrZero(Float value) {
             return value == null ? 0f : value;
+        }
+
+        private static float normalize(float value, float minimum, float maximum) {
+            return clamp((value - minimum) / (maximum - minimum)) * 100f;
         }
     }
 }
